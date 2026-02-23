@@ -32,6 +32,21 @@ musicbrainzngs.set_useragent("cdripper", VERSION, "https://github.com/aaronsb/cd
 # Set by signal handler to request clean shutdown
 _shutdown = False
 
+# Desktop notification support (GNOME, KDE, etc. via freedesktop)
+_has_notify = shutil.which("notify-send") is not None
+
+
+def notify(summary, body="", urgency="normal"):
+    """Send a desktop notification if notify-send is available."""
+    if not _has_notify:
+        return
+    cmd = ["notify-send", "--app-name=cdripper", f"--urgency={urgency}"]
+    icon = {"normal": "media-optical", "critical": "dialog-error"}.get(urgency, "media-optical")
+    cmd.extend([f"--icon={icon}", summary])
+    if body:
+        cmd.append(body)
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def _handle_signal(signum, frame):
     global _shutdown
@@ -238,6 +253,7 @@ def rip_disc(disc, device, output_dir, logfile):
 
     if metadata is None:
         log("No MusicBrainz match. Using disc ID for folder name.", logfile)
+        notify("Unknown disc", f"No MusicBrainz match\nDisc ID: {disc.id}")
         metadata = {
             "artist": "Unknown Artist",
             "album": disc.id,
@@ -251,6 +267,7 @@ def rip_disc(disc, device, output_dir, logfile):
         }
     else:
         log(f"Found: {metadata['artist']} - {metadata['album']}", logfile)
+        notify("Ripping CD", f"{metadata['artist']} \u2014 {metadata['album']}\n{len(metadata['tracks'])} tracks")
 
     # Create output directory
     artist_dir = sanitize_filename(metadata["artist"])
@@ -275,10 +292,23 @@ def rip_disc(disc, device, output_dir, logfile):
             log(f"  ERROR ripping track {track['number']:02d}: {e}", logfile)
             continue
 
+    # Count how many tracks actually ripped successfully
+    ripped = len(list(album_dir.glob("*.flac")))
+    total = len(metadata["tracks"])
+
     write_album_info(album_dir, metadata)
     write_playlist(album_dir, metadata)
     log(f"Album written to {album_dir}", logfile)
-    return True
+
+    if ripped == total:
+        notify("Rip complete", f"{metadata['artist']} \u2014 {metadata['album']}\n{ripped} tracks")
+    elif ripped > 0:
+        notify("Rip finished with errors",
+               f"{metadata['artist']} \u2014 {metadata['album']}\n{ripped}/{total} tracks", "critical")
+    else:
+        notify("Rip failed", f"{metadata['artist']} \u2014 {metadata['album']}", "critical")
+
+    return ripped > 0
 
 
 def poll_and_rip(device, output_dir, poll_interval=2):
