@@ -43,6 +43,16 @@ fi
 
 info "Detected ${BOLD}${PRETTY_NAME:-$DISTRO}${RESET}"
 
+# Check for existing install
+EXISTING_VERSION=""
+if command -v cdripper &>/dev/null; then
+    EXISTING_VERSION="$(cdripper --version 2>/dev/null || echo "")"
+    info "Existing install found: ${BOLD}${EXISTING_VERSION}${RESET}"
+    info "Running upgrade"
+else
+    info "Fresh install"
+fi
+
 # --- System packages (needs root) ---
 step "Installing system packages"
 warn "sudo will be requested once, then dropped."
@@ -129,7 +139,14 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-ok "Service installed ${DIM}(disabled by default)${RESET}"
+
+# If service was already running, restart it with the new version
+if systemctl --user is-active --quiet cdripper 2>/dev/null; then
+    systemctl --user restart cdripper
+    ok "Service restarted with new version"
+else
+    ok "Service installed ${DIM}(disabled by default)${RESET}"
+fi
 
 # --- Verify installation ---
 step "Verifying installation"
@@ -188,7 +205,11 @@ fi
 
 # --- Done ---
 printf "\n"
-printf "%s\n" "${GREEN}${BOLD}Setup complete!${RESET}"
+if [ -n "$EXISTING_VERSION" ]; then
+    printf "%s\n" "${GREEN}${BOLD}Upgrade complete!${RESET} ${DIM}${EXISTING_VERSION} → ${INSTALLED_VERSION}${RESET}"
+else
+    printf "%s\n" "${GREEN}${BOLD}Setup complete!${RESET}"
+fi
 printf "\n"
 printf "%s\n" "${BOLD}Usage:${RESET}"
 printf "  %s\n" "cdripper                     ${DIM}# poll and rip to ~/Music${RESET}"
