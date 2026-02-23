@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from glob import glob
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -47,6 +48,141 @@ MAX_TRACK_RETRIES = 3
 MB_RETRIES = 3
 MB_RETRY_DELAY = 5
 
+# CD audio 1x read speed in bytes/sec (75 sectors * 2352 bytes)
+CD_1X_BPS = 176400
+
+
+# --- Drive state for TUI ---
+
+@dataclass
+class DriveState:
+    """Mutable state for one drive, read by the display thread."""
+    device: str
+    label: str = ""
+    status: str = "Waiting"
+    album: str = ""
+    track_num: int = 0
+    track_total: int = 0
+    track_title: str = ""
+    speed: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self):
+        self.label = os.path.basename(self.device)
+
+    def update(self, **kwargs):
+        with self.lock:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "label": self.label,
+                "status": self.status,
+                "album": self.album,
+                "track_num": self.track_num,
+                "track_total": self.track_total,
+                "track_title": self.track_title,
+                "speed": self.speed,
+            }
+
+
+# Global registry of drive states, keyed by device path
+_drive_states: dict[str, DriveState] = {}
+_display_live = None  # Set to a rich Live object when TUI is active
+
+
+def _init_display(devices):
+    """Start the rich live display if we're in a TTY."""
+    global _display_live
+    if not sys.stdout.isatty():
+        return
+
+    try:
+        from rich.live import Live
+        from rich.table import Table
+        from rich.text import Text
+        from rich.console import Console
+
+        console = Console()
+
+        def make_table():
+            t = Table(title=f"cdripper {VERSION}", title_style="bold", show_edge=False,
+                      pad_edge=False, expand=True)
+            t.add_column("Drive", style="cyan", width=8)
+            t.add_column("Status", width=12)
+            t.add_column("Album", ratio=1)
+            t.add_column("Track", width=20)
+            t.add_column("Speed", width=8, justify="right")
+
+            for device in sorted(_drive_states):
+                s = _drive_states[device].snapshot()
+
+                # Status styling
+                status_style = {
+                    "Waiting": "dim",
+                    "Ripping": "green",
+                    "Encoding": "yellow",
+                    "Looking up": "blue",
+                    "Reading TOC": "blue",
+                    "Ejecting": "dim",
+                    "Error": "red bold",
+                }.get(s["status"], "")
+                status = Text(s["status"], style=status_style)
+
+                # Track progress
+                if s["track_total"] > 0:
+                    done = s["track_num"] - 1  # current track is in progress
+                    if s["status"] not in ("Ripping", "Encoding"):
+                        done = s["track_num"]  # finished current track
+                    total = s["track_total"]
+                    filled = int((done / total) * 10) if total else 0
+                    bar = "\u2588" * filled + "\u2591" * (10 - filled)
+                    track = f"{bar} {s['track_num']}/{s['track_total']}"
+                else:
+                    track = ""
+
+                # Speed
+                speed = f"{s['speed']:.1f}x" if s["speed"] > 0 else ""
+
+                # Album (truncate for display)
+                album = s["album"][:40] if s["album"] else ""
+
+                t.add_row(s["label"], status, album, track, speed)
+
+            return t
+
+        live = Live(make_table(), console=console, refresh_per_second=2)
+        live.start()
+        _display_live = live
+
+        # Background refresh
+        def refresh_loop():
+            while not _shutdown and _display_live:
+                try:
+                    _display_live.update(make_table())
+                except Exception:
+                    break
+                time.sleep(0.5)
+
+        t = threading.Thread(target=refresh_loop, daemon=True)
+        t.start()
+
+    except ImportError:
+        pass  # rich not available, fall back to plain output
+
+
+def _stop_display():
+    """Stop the live display."""
+    global _display_live
+    if _display_live:
+        try:
+            _display_live.stop()
+        except Exception:
+            pass
+        _display_live = None
+
 
 def notify(summary, body="", urgency="normal"):
     """Send a desktop notification if notify-send is available."""
@@ -63,6 +199,7 @@ def notify(summary, body="", urgency="normal"):
 def _handle_signal(signum, frame):
     global _shutdown
     _shutdown = True
+    _stop_display()
     print("\nShutting down after current operation...")
 
 
@@ -76,7 +213,7 @@ def sanitize_filename(name, max_length=200):
 
 
 def _device_label(device):
-    """Short label for a device, e.g. /dev/sr0 → sr0."""
+    """Short label for a device, e.g. /dev/sr0 -> sr0."""
     return os.path.basename(device)
 
 
@@ -85,7 +222,11 @@ def log(msg, logfile=None, device=None):
     prefix = f"[{_device_label(device)}] " if device else ""
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {prefix}{msg}"
     with _log_lock:
-        print(line, flush=True)
+        if _display_live:
+            # Print below the live table
+            _display_live.console.print(line, highlight=False)
+        else:
+            print(line, flush=True)
         if logfile:
             with open(logfile, "a") as f:
                 f.write(line + "\n")
@@ -107,7 +248,6 @@ def detect_drives():
     """Auto-detect all optical drives."""
     drives = sorted(glob("/dev/sr*"))
     if not drives:
-        # Fallback: check for /dev/cdrom symlink
         if os.path.exists("/dev/cdrom"):
             drives = ["/dev/cdrom"]
     return drives
@@ -153,7 +293,6 @@ def lookup_metadata(disc, logfile=None, device=None):
     album = release.get("title", "Unknown Album")
     date = release.get("date", "")
 
-    # Find the medium that matches our disc
     tracks = []
     for medium in release.get("medium-list", []):
         for disc_entry in medium.get("disc-list", []):
@@ -163,7 +302,6 @@ def lookup_metadata(disc, logfile=None, device=None):
         if tracks:
             break
 
-    # Fallback: if we didn't match a medium, use the first one
     if not tracks:
         for medium in release.get("medium-list", []):
             tracks = _extract_tracks(medium, album_artist)
@@ -190,7 +328,6 @@ def _extract_tracks(medium, album_artist):
     for track in medium.get("track-list", []):
         recording = track.get("recording", {})
 
-        # Per-track artist: check recording's artist-credit first
         track_artist = album_artist
         artist_credit = recording.get("artist-credit", [])
         if artist_credit:
@@ -212,42 +349,52 @@ def _extract_tracks(medium, album_artist):
     return tracks
 
 
-def rip_and_encode(device, track_num, output_path, logfile=None, track_label=""):
+def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
+                   drive_state=None):
     """Rip a single track with cdparanoia and encode to FLAC.
 
-    Streams cdparanoia stderr for progress visibility and runs a heartbeat
-    so the user knows it hasn't stalled.
+    Monitors the temp WAV file size to calculate read speed.
     """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = tmp.name
 
     start_time = time.time()
+    speed_stop = threading.Event()
 
-    # Heartbeat thread — prints elapsed time every 30s while ripping
-    heartbeat_stop = threading.Event()
+    def speed_monitor():
+        """Periodically check WAV file size to calculate read speed."""
+        last_size = 0
+        last_time = start_time
+        while not speed_stop.wait(2):
+            try:
+                current_size = os.path.getsize(wav_path)
+            except OSError:
+                continue
+            now = time.time()
+            dt = now - last_time
+            if dt > 0:
+                bps = (current_size - last_size) / dt
+                speed = bps / CD_1X_BPS
+                if drive_state:
+                    drive_state.update(speed=speed)
+            last_size = current_size
+            last_time = now
 
-    def heartbeat():
-        while not heartbeat_stop.wait(30):
-            elapsed = time.time() - start_time
-            mins, secs = divmod(int(elapsed), 60)
-            log(f"  {track_label} still ripping... ({mins}m{secs:02d}s elapsed)",
-                logfile, device)
-
-    hb = threading.Thread(target=heartbeat, daemon=True)
-    hb.start()
+    mon = threading.Thread(target=speed_monitor, daemon=True)
+    mon.start()
 
     try:
-        # Stream cdparanoia stderr so progress is visible
         proc = subprocess.Popen(
             ["cdparanoia", "-d", device, str(track_num), wav_path],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-        # Drain stderr (cdparanoia writes progress there)
-        proc.stderr.read()
         proc.wait()
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, "cdparanoia")
+
+        if drive_state:
+            drive_state.update(status="Encoding", speed=0.0)
 
         subprocess.run(
             ["flac", "-s", "-8", "-o", str(output_path), wav_path],
@@ -255,8 +402,8 @@ def rip_and_encode(device, track_num, output_path, logfile=None, track_label="")
             capture_output=True,
         )
     finally:
-        heartbeat_stop.set()
-        hb.join(timeout=1)
+        speed_stop.set()
+        mon.join(timeout=1)
         if os.path.exists(wav_path):
             os.unlink(wav_path)
 
@@ -329,10 +476,13 @@ def eject_disc(device):
     subprocess.run(["eject", device], capture_output=True)
 
 
-def rip_disc(disc, device, output_dir, logfile):
+def rip_disc(disc, device, output_dir, logfile, drive_state=None):
     """Full rip pipeline for one disc."""
     total = disc.last_track_num
     log(f"Disc ID: {disc.id}, {total} tracks", logfile, device)
+
+    if drive_state:
+        drive_state.update(status="Looking up", track_num=0, track_total=total)
 
     log("Looking up metadata on MusicBrainz...", logfile, device)
     metadata = lookup_metadata(disc, logfile, device)
@@ -353,7 +503,12 @@ def rip_disc(disc, device, output_dir, logfile):
         }
     else:
         log(f"Found: {metadata['artist']} - {metadata['album']}", logfile, device)
-        notify("Ripping CD", f"{metadata['artist']} \u2014 {metadata['album']}\n{len(metadata['tracks'])} tracks")
+        notify("Ripping CD",
+               f"{metadata['artist']} \u2014 {metadata['album']}\n{len(metadata['tracks'])} tracks")
+
+    album_display = f"{metadata['artist']} \u2014 {metadata['album']}"
+    if drive_state:
+        drive_state.update(album=album_display, track_total=len(metadata["tracks"]))
 
     # Create output directory
     artist_dir = sanitize_filename(metadata["artist"])
@@ -364,7 +519,6 @@ def rip_disc(disc, device, output_dir, logfile):
     total = len(metadata["tracks"])
     failed_tracks = set()
 
-    # Rip each track
     for track in metadata["tracks"]:
         if _shutdown:
             log("Shutdown requested, stopping after current track.", logfile, device)
@@ -376,24 +530,28 @@ def rip_disc(disc, device, output_dir, logfile):
         flac_path = album_dir / fname
         log(f"  Ripping {track_label}", logfile, device)
 
+        if drive_state:
+            drive_state.update(status="Ripping", track_num=num,
+                               track_title=track["title"], speed=0.0)
+
         success = False
         for attempt in range(1, MAX_TRACK_RETRIES + 1):
             try:
-                rip_and_encode(device, num, flac_path, logfile, track_label)
+                rip_and_encode(device, num, flac_path, logfile, track_label,
+                               drive_state)
                 tag_flac(flac_path, metadata, track)
                 success = True
                 break
             except subprocess.CalledProcessError as e:
                 if attempt < MAX_TRACK_RETRIES:
-                    log(f"  ERROR on {track_label} (attempt {attempt}/{MAX_TRACK_RETRIES}), retrying...",
-                        logfile, device)
+                    log(f"  ERROR on {track_label} (attempt {attempt}/{MAX_TRACK_RETRIES}), "
+                        f"retrying...", logfile, device)
                 else:
                     log(f"  FAILED {track_label} after {MAX_TRACK_RETRIES} attempts: {e}",
                         logfile, device)
 
         if not success:
             failed_tracks.add(num)
-            # Clean up partial file if it exists
             if flac_path.exists():
                 flac_path.unlink()
 
@@ -403,15 +561,20 @@ def rip_disc(disc, device, output_dir, logfile):
     write_playlist(album_dir, metadata, failed_tracks or None)
     log(f"Album written to {album_dir}", logfile, device)
 
+    if drive_state:
+        drive_state.update(status="Done", speed=0.0, track_num=total)
+
     if not failed_tracks:
-        notify("Rip complete", f"{metadata['artist']} \u2014 {metadata['album']}\n{ripped} tracks")
+        notify("Rip complete",
+               f"{metadata['artist']} \u2014 {metadata['album']}\n{ripped} tracks")
     elif ripped > 0:
         failed_list = ", ".join(str(t) for t in sorted(failed_tracks))
         notify("Rip finished with errors",
                f"{metadata['artist']} \u2014 {metadata['album']}\n"
                f"{ripped}/{total} tracks, failed: {failed_list}", "critical")
     else:
-        notify("Rip failed", f"{metadata['artist']} \u2014 {metadata['album']}", "critical")
+        notify("Rip failed",
+               f"{metadata['artist']} \u2014 {metadata['album']}", "critical")
 
     return ripped > 0
 
@@ -422,6 +585,8 @@ def poll_and_rip(device, output_dir, poll_interval=2):
     log_dir.mkdir(parents=True, exist_ok=True)
     logfile = str(log_dir / "cdripper.log")
 
+    drive_state = _drive_states.get(device)
+
     log(f"cdripper {VERSION} started", logfile, device)
     log(f"Watching {device}, output to {output_dir}", logfile, device)
     log("Insert a disc to begin.", logfile, device)
@@ -430,14 +595,24 @@ def poll_and_rip(device, output_dir, poll_interval=2):
         disc = read_disc(device)
         if disc is not None:
             log("Disc detected", logfile, device)
-            success = rip_disc(disc, device, output_dir, logfile)
+            if drive_state:
+                drive_state.update(status="Reading TOC")
+
+            success = rip_disc(disc, device, output_dir, logfile, drive_state)
+
+            if drive_state:
+                drive_state.update(status="Ejecting", speed=0.0)
+
             if success:
                 log("Rip complete. Ejecting.", logfile, device)
             else:
                 log("Rip failed or interrupted. Ejecting.", logfile, device)
             eject_disc(device)
+
+            if drive_state:
+                drive_state.update(status="Waiting", album="", track_num=0,
+                                   track_total=0, track_title="", speed=0.0)
             log("Ready for next disc.", logfile, device)
-            # Brief pause after eject before polling again
             time.sleep(5)
         else:
             time.sleep(poll_interval)
@@ -490,7 +665,7 @@ def main():
         devices = args.device
 
     if args.once:
-        # --once with multiple drives: rip whichever has a disc
+        # --once: no TUI, just rip and exit
         log_dir = Path(args.output) / "_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         logfile = str(log_dir / "cdripper.log")
@@ -504,12 +679,17 @@ def main():
 
         log("No disc found in any drive.", logfile)
         sys.exit(1)
-    else:
+
+    # Initialize drive states and display
+    for device in devices:
+        _drive_states[device] = DriveState(device=device)
+
+    _init_display(devices)
+
+    try:
         if len(devices) == 1:
-            # Single drive — run in main thread
             poll_and_rip(devices[0], args.output)
         else:
-            # Multiple drives — one thread per drive
             threads = []
             for device in devices:
                 t = threading.Thread(
@@ -521,12 +701,10 @@ def main():
                 t.start()
                 threads.append(t)
 
-            # Wait for all threads (or shutdown signal)
-            try:
-                while not _shutdown and any(t.is_alive() for t in threads):
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
+            while not _shutdown and any(t.is_alive() for t in threads):
+                time.sleep(1)
+    finally:
+        _stop_display()
 
 
 if __name__ == "__main__":
