@@ -2,7 +2,7 @@
 
 Rip audio CDs to FLAC with MusicBrainz metadata. One Python script, no complex toolchain.
 
-Polls your CD drive, looks up album/artist/track info from MusicBrainz, rips with cdparanoia (EAC-quality error correction), encodes to FLAC, tags, and organizes into `Artist/Album/` directories. Ejects when done, waits for the next disc.
+Polls your CD drive, looks up album/artist/track info from MusicBrainz, rips with cdparanoia (EAC-quality error correction), encodes to FLAC, tags, and organizes into `Artist/Album/` directories. Ejects when done, waits for the next disc. Supports multiple drives in parallel.
 
 ## Install
 
@@ -14,6 +14,7 @@ The installer:
 - Installs system packages via your package manager (sudo, asked once, then dropped)
 - Installs cdripper in an isolated virtualenv via pipx (no sudo)
 - Sets up a systemd user service (disabled by default)
+- Re-running the installer upgrades an existing install
 
 Works on Arch, Ubuntu/Kubuntu, Debian, Fedora, and derivatives.
 
@@ -28,10 +29,12 @@ pipx install git+https://github.com/aaronsb/cdreader.git
 ## Usage
 
 ```bash
-cdripper                        # poll for discs, rip to ~/Music
-cdripper -d /dev/sr0            # specific CD device
-cdripper -o /mnt/nas/music      # custom output directory
-cdripper --once                 # rip one disc and exit
+cdripper                            # poll /dev/cdrom, rip to ~/Music
+cdripper -d /dev/sr0                # specific device
+cdripper -d /dev/sr0 /dev/sr1       # multiple drives in parallel
+cdripper -d all                     # auto-detect all optical drives
+cdripper -o /mnt/nas/music          # custom output directory
+cdripper --once                     # rip one disc and exit
 ```
 
 To auto-start on login:
@@ -59,9 +62,16 @@ systemctl --user enable --now cdripper
 ```
 
 - FLAC files at max compression (`flac -8`) with full Vorbis tags
-- `album_info.txt` has all metadata in `KEY=value` format
+- `album_info.txt` has all metadata in `KEY=value` format, including `FAILED_TRACKS` for any tracks that couldn't be ripped
 - `.m3u` playlist for each album
 - Filenames sanitized: special characters become `_`
+- Desktop notifications on GNOME/KDE for rip progress and errors
+
+## Error Handling
+
+- **MusicBrainz down?** Retries 3 times with backoff, then rips with disc ID as album name
+- **Scratched disc?** Retries each failed track up to 3 times. Failed tracks are logged in `album_info.txt` with `FAILED_TRACKS=` so you can go back and re-attempt later
+- **Drive looks stalled?** Heartbeat prints elapsed time every 30s while cdparanoia works through bad sectors
 
 ## Dependencies
 
@@ -76,15 +86,15 @@ Installed automatically by `setup.sh`:
 
 ## How It Works
 
-1. Poll the CD drive by attempting to read the disc TOC
-2. On disc detection, compute disc ID and query MusicBrainz
-3. Rip each track with cdparanoia (paranoia mode error correction)
+1. Poll CD drive(s) by attempting to read the disc TOC
+2. On disc detection, compute disc ID and query MusicBrainz (3 retries)
+3. Rip each track with cdparanoia (paranoia mode, retries on failure)
 4. Encode to FLAC at max compression
 5. Tag each file with Vorbis comments (artist, album, title, track number)
 6. Write `album_info.txt` and `.m3u` playlist
 7. Eject, wait for next disc
 
-If MusicBrainz doesn't recognize the disc, tracks are ripped with the disc ID as the album name and generic track numbers.
+Multiple drives rip in parallel, each in its own thread with prefixed log output.
 
 ## License
 
