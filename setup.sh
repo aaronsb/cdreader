@@ -128,6 +128,58 @@ EOF
 systemctl --user daemon-reload
 ok "Service installed ${DIM}(disabled by default)${RESET}"
 
+# --- Verify installation ---
+step "Verifying installation"
+
+TESTS_PASSED=0
+TESTS_FAILED=0
+
+check() {
+    local desc="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        ok "$desc"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        printf "%s\n" "${RED}FAIL${RESET} $desc"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
+# System binaries
+check "cdparanoia found"     command -v cdparanoia
+check "flac found"           command -v flac
+check "eject found"          command -v eject
+
+# cdripper binary (use full path since PATH may not be updated yet)
+CDRIPPER_BIN="$HOME/.local/bin/cdripper"
+check "cdripper binary"      test -x "$CDRIPPER_BIN"
+check "cdripper --version"   "$CDRIPPER_BIN" --version
+
+# Python imports inside the pipx venv
+PIPX_PYTHON="$(dirname "$CDRIPPER_BIN")/../pipx/venvs/cdripper/bin/python" 2>/dev/null || true
+if [ ! -x "$PIPX_PYTHON" ]; then
+    # fallback: find it via pipx's standard venv location
+    PIPX_PYTHON="$HOME/.local/pipx/venvs/cdripper/bin/python"
+fi
+
+check "python: discid"          "$PIPX_PYTHON" -c "import discid"
+check "python: musicbrainzngs"  "$PIPX_PYTHON" -c "import musicbrainzngs"
+check "python: mutagen"         "$PIPX_PYTHON" -c "import mutagen.flac"
+
+# libdiscid shared library
+check "libdiscid.so"         "$PIPX_PYTHON" -c "import ctypes; ctypes.cdll.LoadLibrary('libdiscid.so.0')"
+
+# systemd service file
+check "systemd service file" test -f "$SERVICE_DIR/cdripper.service"
+
+printf "\n"
+if [ "$TESTS_FAILED" -eq 0 ]; then
+    ok "${BOLD}All $TESTS_PASSED checks passed${RESET}"
+else
+    warn "${TESTS_PASSED} passed, ${RED}${TESTS_FAILED} failed${RESET}"
+fi
+
 # --- Done ---
 printf "\n"
 printf "%s\n" "${GREEN}${BOLD}Setup complete!${RESET}"
