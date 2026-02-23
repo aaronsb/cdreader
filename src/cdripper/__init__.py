@@ -136,8 +136,8 @@ def _init_display(devices):
                 # Track progress: bar shows intra-track, text shows album position
                 if s["track_total"] > 0:
                     tp = s["track_progress"]
-                    filled = int(tp * 10)
-                    bar = "\u2588" * filled + "\u2591" * (10 - filled)
+                    filled = int(tp * 12)
+                    bar = "\u2588" * filled + "\u2591" * (12 - filled)
                     pct = f"{int(tp * 100):>3d}%"
                     track = f"{bar} {pct} {s['track_num']}/{s['track_total']}"
                 else:
