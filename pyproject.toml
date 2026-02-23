@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cdripper"
+version = "0.1.0"
+description = "Rip audio CDs to FLAC with MusicBrainz metadata"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "discid",
+    "musicbrainzngs",
+    "mutagen",
+]
+
+[project.scripts]
+cdripper = "cdripper:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/aaronsb/cdreader"
