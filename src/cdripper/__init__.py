@@ -64,6 +64,7 @@ class DriveState:
     track_num: int = 0
     track_total: int = 0
     track_title: str = ""
+    track_progress: float = 0.0
     speed: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -84,6 +85,7 @@ class DriveState:
                 "track_num": self.track_num,
                 "track_total": self.track_total,
                 "track_title": self.track_title,
+                "track_progress": self.track_progress,
                 "speed": self.speed,
             }
 
@@ -113,7 +115,7 @@ def _init_display(devices):
             t.add_column("Drive", style="cyan", width=8)
             t.add_column("Status", width=12)
             t.add_column("Album", ratio=1)
-            t.add_column("Track", width=20)
+            t.add_column("Track", width=24)
             t.add_column("Speed", width=8, justify="right")
 
             for device in sorted(_drive_states):
@@ -131,15 +133,13 @@ def _init_display(devices):
                 }.get(s["status"], "")
                 status = Text(s["status"], style=status_style)
 
-                # Track progress
+                # Track progress: bar shows intra-track, text shows album position
                 if s["track_total"] > 0:
-                    done = s["track_num"] - 1  # current track is in progress
-                    if s["status"] not in ("Ripping", "Encoding"):
-                        done = s["track_num"]  # finished current track
-                    total = s["track_total"]
-                    filled = int((done / total) * 10) if total else 0
+                    tp = s["track_progress"]
+                    filled = int(tp * 10)
                     bar = "\u2588" * filled + "\u2591" * (10 - filled)
-                    track = f"{bar} {s['track_num']}/{s['track_total']}"
+                    pct = f"{int(tp * 100):>3d}%"
+                    track = f"{bar} {pct} {s['track_num']}/{s['track_total']}"
                 else:
                     track = ""
 
@@ -350,10 +350,10 @@ def _extract_tracks(medium, album_artist):
 
 
 def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
-                   drive_state=None):
+                   drive_state=None, expected_wav_size=0):
     """Rip a single track with cdparanoia and encode to FLAC.
 
-    Monitors the temp WAV file size to calculate read speed.
+    Monitors the temp WAV file size to calculate read speed and track progress.
     """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = tmp.name
@@ -362,7 +362,7 @@ def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
     speed_stop = threading.Event()
 
     def speed_monitor():
-        """Periodically check WAV file size to calculate read speed."""
+        """Periodically check WAV file size to calculate read speed and progress."""
         last_size = 0
         last_time = start_time
         while not speed_stop.wait(2):
@@ -375,8 +375,9 @@ def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
             if dt > 0:
                 bps = (current_size - last_size) / dt
                 speed = bps / CD_1X_BPS
+                progress = min(current_size / expected_wav_size, 1.0) if expected_wav_size > 0 else 0.0
                 if drive_state:
-                    drive_state.update(speed=speed)
+                    drive_state.update(speed=speed, track_progress=progress)
             last_size = current_size
             last_time = now
 
@@ -394,7 +395,7 @@ def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
             raise subprocess.CalledProcessError(proc.returncode, "cdparanoia")
 
         if drive_state:
-            drive_state.update(status="Encoding", speed=0.0)
+            drive_state.update(status="Encoding", speed=0.0, track_progress=1.0)
 
         subprocess.run(
             ["flac", "-s", "-8", "-o", str(output_path), wav_path],
@@ -516,6 +517,11 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
     album_dir = Path(output_dir) / artist_dir / album_dir_name
     album_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build expected WAV sizes from disc TOC (sectors * 2352 bytes + 44 byte header)
+    track_wav_sizes = {}
+    for dt in disc.tracks:
+        track_wav_sizes[dt.number] = dt.sectors * 2352 + 44
+
     total = len(metadata["tracks"])
     failed_tracks = set()
 
@@ -530,15 +536,18 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
         flac_path = album_dir / fname
         log(f"  Ripping {track_label}", logfile, device)
 
+        expected_wav = track_wav_sizes.get(num, 0)
+
         if drive_state:
             drive_state.update(status="Ripping", track_num=num,
-                               track_title=track["title"], speed=0.0)
+                               track_title=track["title"], speed=0.0,
+                               track_progress=0.0)
 
         success = False
         for attempt in range(1, MAX_TRACK_RETRIES + 1):
             try:
                 rip_and_encode(device, num, flac_path, logfile, track_label,
-                               drive_state)
+                               drive_state, expected_wav_size=expected_wav)
                 tag_flac(flac_path, metadata, track)
                 success = True
                 break
@@ -562,7 +571,7 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
     log(f"Album written to {album_dir}", logfile, device)
 
     if drive_state:
-        drive_state.update(status="Done", speed=0.0, track_num=total)
+        drive_state.update(status="Done", speed=0.0, track_num=total, track_progress=1.0)
 
     if not failed_tracks:
         notify("Rip complete",
@@ -611,7 +620,8 @@ def poll_and_rip(device, output_dir, poll_interval=2):
 
             if drive_state:
                 drive_state.update(status="Waiting", album="", track_num=0,
-                                   track_total=0, track_title="", speed=0.0)
+                                   track_total=0, track_title="", speed=0.0,
+                                   track_progress=0.0)
             log("Ready for next disc.", logfile, device)
             time.sleep(5)
         else:
