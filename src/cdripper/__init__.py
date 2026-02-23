@@ -114,7 +114,7 @@ def _init_display(devices):
                       pad_edge=False, expand=True)
             t.add_column("Drive", style="cyan", width=8)
             t.add_column("Status", width=12)
-            t.add_column("Album", ratio=1)
+            t.add_column("Album", ratio=1, no_wrap=True, overflow="ellipsis")
             t.add_column("Track", width=24)
             t.add_column("Speed", width=8, justify="right")
 
@@ -146,8 +146,7 @@ def _init_display(devices):
                 # Speed
                 speed = f"{s['speed']:.1f}x" if s["speed"] > 0 else ""
 
-                # Album (truncate for display)
-                album = s["album"][:40] if s["album"] else ""
+                album = s["album"] or ""
 
                 t.add_row(s["label"], status, album, track, speed)
 
