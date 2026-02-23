@@ -54,9 +54,14 @@ def _handle_signal(signum, frame):
     print("\nShutting down after current operation...")
 
 
-def sanitize_filename(name):
-    """Replace anything not [-a-zA-Z0-9_ .] with underscore."""
-    return re.sub(r"[^-\w .]", "_", name)
+def sanitize_filename(name, max_length=200):
+    """Replace anything not [-a-zA-Z0-9_ .] with underscore, and truncate."""
+    sanitized = re.sub(r"[^-\w .]", "_", name)
+    if len(sanitized.encode("utf-8")) > max_length:
+        # Truncate to max_length bytes while keeping valid UTF-8
+        truncated = sanitized.encode("utf-8")[:max_length].decode("utf-8", errors="ignore")
+        sanitized = truncated.rstrip(" _-")
+    return sanitized
 
 
 def log(msg, logfile=None):
