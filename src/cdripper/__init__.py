@@ -15,13 +15,17 @@ import subprocess
 import sys
 import tempfile
 import time
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 import discid
 import musicbrainzngs
 from mutagen.flac import FLAC
 
-VERSION = "0.1.0"
+try:
+    VERSION = pkg_version("cdripper")
+except Exception:
+    VERSION = "dev"
 
 musicbrainzngs.set_useragent("cdripper", VERSION, "https://github.com/aaronsb/cdreader")
 

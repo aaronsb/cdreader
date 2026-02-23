@@ -154,7 +154,9 @@ check "eject found"          command -v eject
 # cdripper binary (use full path since PATH may not be updated yet)
 CDRIPPER_BIN="$HOME/.local/bin/cdripper"
 check "cdripper binary"      test -x "$CDRIPPER_BIN"
-check "cdripper --version"   "$CDRIPPER_BIN" --version
+INSTALLED_VERSION="$("$CDRIPPER_BIN" --version 2>/dev/null || echo "unknown")"
+check "cdripper version"    test "$INSTALLED_VERSION" != "unknown"
+info "Installed: ${BOLD}${INSTALLED_VERSION}${RESET}"
 
 # Python imports inside the pipx venv
 PIPX_VENVS="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null || echo "")"
