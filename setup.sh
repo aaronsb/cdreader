@@ -99,10 +99,13 @@ if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
         else
             ok "Already in ${DIM}$RC_FILE${RESET}"
         fi
-        warn "Run ${BOLD}source $RC_FILE${RESET} or open a new terminal for PATH changes."
     else
         warn "Unknown shell ($SHELL_NAME). Add manually: $PATH_LINE"
     fi
+
+    # Apply to current session so the rest of this script (and the user) can find cdripper
+    export PATH="$USER_BIN:$PATH"
+    ok "PATH updated for this session"
 fi
 
 # --- systemd user service ---
