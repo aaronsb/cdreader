@@ -157,11 +157,12 @@ check "cdripper binary"      test -x "$CDRIPPER_BIN"
 check "cdripper --version"   "$CDRIPPER_BIN" --version
 
 # Python imports inside the pipx venv
-PIPX_PYTHON="$(dirname "$CDRIPPER_BIN")/../pipx/venvs/cdripper/bin/python" 2>/dev/null || true
-if [ ! -x "$PIPX_PYTHON" ]; then
-    # fallback: find it via pipx's standard venv location
-    PIPX_PYTHON="$HOME/.local/pipx/venvs/cdripper/bin/python"
+PIPX_VENVS="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null || echo "")"
+if [ -z "$PIPX_VENVS" ]; then
+    # parse from pipx environment output
+    PIPX_VENVS="$(pipx environment 2>/dev/null | grep PIPX_LOCAL_VENVS | cut -d= -f2)"
 fi
+PIPX_PYTHON="${PIPX_VENVS}/cdripper/bin/python3"
 
 check "python: discid"          "$PIPX_PYTHON" -c "import discid"
 check "python: musicbrainzngs"  "$PIPX_PYTHON" -c "import musicbrainzngs"
