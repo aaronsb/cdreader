@@ -7,6 +7,7 @@ tags with MusicBrainz metadata, and organizes into Artist/Album/ directories.
 """
 
 import argparse
+from collections import deque
 import os
 import re
 import shutil
@@ -55,6 +56,12 @@ MB_RETRY_DELAY = 5
 # CD audio 1x read speed in bytes/sec (75 sectors * 2352 bytes)
 CD_1X_BPS = 176400
 
+# Per-drive log buffer depth (circular)
+LOG_BUFFER_LINES = 50
+
+# Minimum width per log column before switching to vertical stack
+MIN_LOG_COL_WIDTH = 40
+
 
 # --- Drive state for TUI ---
 
@@ -70,6 +77,7 @@ class DriveState:
     track_title: str = ""
     track_progress: float = 0.0
     speed: float = 0.0
+    log_lines: deque = field(default_factory=lambda: deque(maxlen=LOG_BUFFER_LINES), repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self):
@@ -79,6 +87,14 @@ class DriveState:
         with self.lock:
             for k, v in kwargs.items():
                 setattr(self, k, v)
+
+    def add_log(self, msg):
+        with self.lock:
+            self.log_lines.append(msg)
+
+    def get_logs(self):
+        with self.lock:
+            return list(self.log_lines)
 
     def snapshot(self):
         with self.lock:
@@ -110,6 +126,8 @@ def _init_display(devices):
         from rich.table import Table
         from rich.text import Text
         from rich.console import Console
+        from rich.layout import Layout
+        from rich.panel import Panel
 
         console = Console()
 
@@ -156,7 +174,61 @@ def _init_display(devices):
 
             return t
 
-        live = Live(make_table(), console=console, refresh_per_second=2)
+        def make_display():
+            """Build full TUI: status table on top, per-drive log panels below."""
+            table = make_table()
+            drive_count = len(_drive_states)
+            if drive_count == 0:
+                return table
+
+            # Calculate available height for log panels
+            term_height = console.height or 25
+            # Table: 1 title + 2 header/separator + N rows + 1 bottom = N + 4
+            table_height = drive_count + 4
+            # Panel border takes 2 lines; leave at least 5 inner lines
+            log_inner_height = max(term_height - table_height - 4, 5)
+
+            sorted_devices = sorted(_drive_states)
+
+            if drive_count == 1:
+                ds = _drive_states[sorted_devices[0]]
+                visible = ds.get_logs()[-log_inner_height:]
+                log_text = Text("\n".join(visible)) if visible else Text(
+                    "Waiting for activity...", style="dim")
+                log_panel = Panel(log_text, title=f"Log [{ds.label}]",
+                                  border_style="dim")
+            else:
+                # Build per-drive panels
+                panels = []
+                for device in sorted_devices:
+                    ds = _drive_states[device]
+                    visible = ds.get_logs()[-log_inner_height:]
+                    log_text = Text("\n".join(visible)) if visible else Text(
+                        "Waiting...", style="dim")
+                    panels.append(Layout(
+                        Panel(log_text, title=ds.label, border_style="cyan"),
+                        name=ds.label,
+                    ))
+
+                # Horizontal columns unless too narrow, then stack vertically
+                log_area = Layout(name="logs")
+                col_width = (console.width or 80) // drive_count
+                if col_width >= MIN_LOG_COL_WIDTH:
+                    log_area.split_row(*panels)
+                else:
+                    log_area.split_column(*panels)
+
+                log_panel = log_area
+
+            layout = Layout(name="root")
+            layout.split_column(
+                Layout(table, name="status", size=table_height),
+                Layout(log_panel, name="log_area"),
+            )
+            return layout
+
+        live = Live(make_display(), console=console, screen=True,
+                    refresh_per_second=2)
         live.start()
         _display_live = live
 
@@ -164,7 +236,7 @@ def _init_display(devices):
         def refresh_loop():
             while not _shutdown and _display_live:
                 try:
-                    _display_live.update(make_table())
+                    _display_live.update(make_display())
                 except Exception:
                     break
                 time.sleep(0.5)
@@ -245,8 +317,12 @@ def log(msg, logfile=None, device=None):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {prefix}{msg}"
     with _log_lock:
         if _display_live:
-            # Print below the live table
-            _display_live.console.print(line, highlight=False)
+            # Route to per-drive log buffer (rendered by the TUI refresh loop)
+            if device and device in _drive_states:
+                _drive_states[device].add_log(line)
+            elif _drive_states:
+                for ds in _drive_states.values():
+                    ds.add_log(line)
         else:
             print(line, flush=True)
         if logfile:
