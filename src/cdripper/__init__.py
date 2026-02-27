@@ -396,8 +396,13 @@ def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
         if drive_state:
             drive_state.update(status="Encoding", speed=0.0, track_progress=1.0)
 
+        # Remove existing FLAC to avoid encoder refusal on re-rip
+        out = Path(output_path)
+        if out.exists():
+            out.unlink()
+
         subprocess.run(
-            ["flac", "-s", "-8", "-o", str(output_path), wav_path],
+            ["flac", "-s", "-8", "--force", "-o", str(output_path), wav_path],
             check=True,
             capture_output=True,
         )
@@ -533,6 +538,8 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
         track_label = f"Track {num:02d}/{total:02d}: {track['title']}"
         fname = _track_filename(track, metadata)
         flac_path = album_dir / fname
+        if flac_path.exists():
+            log(f"  {track_label}: overwriting existing file", logfile, device)
         log(f"  Ripping {track_label}", logfile, device)
 
         expected_wav = track_wav_sizes.get(num, 0)
@@ -550,10 +557,10 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
                 tag_flac(flac_path, metadata, track)
                 success = True
                 break
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError, OSError) as e:
                 if attempt < MAX_TRACK_RETRIES:
-                    log(f"  ERROR on {track_label} (attempt {attempt}/{MAX_TRACK_RETRIES}), "
-                        f"retrying...", logfile, device)
+                    log(f"  ERROR on {track_label} (attempt {attempt}/{MAX_TRACK_RETRIES}): "
+                        f"{e}, retrying...", logfile, device)
                 else:
                     log(f"  FAILED {track_label} after {MAX_TRACK_RETRIES} attempts: {e}",
                         logfile, device)
