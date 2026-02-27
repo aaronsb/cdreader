@@ -355,7 +355,7 @@ def read_disc(device):
     """Try to read the disc TOC. Returns discid.Disc or None."""
     try:
         return discid.read(device)
-    except discid.DiscError:
+    except (discid.DiscError, OSError):
         return None
 
 
@@ -705,32 +705,37 @@ def poll_and_rip(device, output_dir, poll_interval=2):
     log(f"Watching {device}, output to {output_dir}", logfile, device)
     log("Insert a disc to begin.", logfile, device)
 
-    while not _shutdown:
-        disc = read_disc(device)
-        if disc is not None:
-            log("Disc detected", logfile, device)
-            if drive_state:
-                drive_state.update(status="Reading TOC")
+    try:
+        while not _shutdown:
+            disc = read_disc(device)
+            if disc is not None:
+                log("Disc detected", logfile, device)
+                if drive_state:
+                    drive_state.update(status="Reading TOC")
 
-            success = rip_disc(disc, device, output_dir, logfile, drive_state)
+                success = rip_disc(disc, device, output_dir, logfile, drive_state)
 
-            if drive_state:
-                drive_state.update(status="Ejecting", speed=0.0)
+                if drive_state:
+                    drive_state.update(status="Ejecting", speed=0.0)
 
-            if success:
-                log("Rip complete. Ejecting.", logfile, device)
+                if success:
+                    log("Rip complete. Ejecting.", logfile, device)
+                else:
+                    log("Rip failed or interrupted. Ejecting.", logfile, device)
+                eject_disc(device)
+
+                if drive_state:
+                    drive_state.update(status="Waiting", album="", track_num=0,
+                                       track_total=0, track_title="", speed=0.0,
+                                       track_progress=0.0)
+                log("Ready for next disc.", logfile, device)
+                time.sleep(5)
             else:
-                log("Rip failed or interrupted. Ejecting.", logfile, device)
-            eject_disc(device)
-
-            if drive_state:
-                drive_state.update(status="Waiting", album="", track_num=0,
-                                   track_total=0, track_title="", speed=0.0,
-                                   track_progress=0.0)
-            log("Ready for next disc.", logfile, device)
-            time.sleep(5)
-        else:
-            time.sleep(poll_interval)
+                time.sleep(poll_interval)
+    except Exception as e:
+        log(f"Drive error: {e}", logfile, device)
+        if drive_state:
+            drive_state.update(status="Error")
 
     log("Stopped.", logfile, device)
 
@@ -743,7 +748,7 @@ def main():
         "-d", "--device",
         nargs="*",
         default=None,
-        help="CD-ROM device(s), or 'all' to auto-detect (default: /dev/cdrom)",
+        help="CD-ROM device(s) (default: auto-detect all drives)",
     )
     parser.add_argument(
         "-o", "--output",
@@ -767,10 +772,8 @@ def main():
 
     check_dependencies()
 
-    # Resolve device list
-    if args.device is None:
-        devices = ["/dev/cdrom"]
-    elif len(args.device) == 1 and args.device[0] == "all":
+    # Resolve device list (auto-detect by default)
+    if args.device is None or (len(args.device) == 1 and args.device[0] == "all"):
         devices = detect_drives()
         if not devices:
             print("No optical drives detected.", file=sys.stderr)
