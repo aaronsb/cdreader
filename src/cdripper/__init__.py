@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import signal
+import contextlib
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,9 @@ _log_lock = threading.Lock()
 
 # Desktop notification support (GNOME, KDE, etc. via freedesktop)
 _has_notify = shutil.which("notify-send") is not None
+
+# Sleep inhibition support (systemd-based Linux)
+_has_inhibit = shutil.which("systemd-inhibit") is not None
 
 # Track retry config
 MAX_TRACK_RETRIES = 3
@@ -193,6 +197,25 @@ def notify(summary, body="", urgency="normal"):
     if body:
         cmd.append(body)
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@contextlib.contextmanager
+def inhibit_sleep():
+    """Prevent system sleep while ripping using systemd-inhibit."""
+    if not _has_inhibit:
+        yield
+        return
+    proc = subprocess.Popen(
+        ["systemd-inhibit", "--what=sleep:idle",
+         "--who=cdripper", "--why=Ripping audio CD",
+         "--mode=block", "sleep", "infinity"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 def _handle_signal(signum, frame):
@@ -680,47 +703,48 @@ def main():
     else:
         devices = args.device
 
-    if args.once:
-        # --once: no TUI, just rip and exit
-        log_dir = Path(args.output) / "_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        logfile = str(log_dir / "cdripper.log")
+    with inhibit_sleep():
+        if args.once:
+            # --once: no TUI, just rip and exit
+            log_dir = Path(args.output) / "_logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            logfile = str(log_dir / "cdripper.log")
 
-        for device in devices:
-            disc = read_disc(device)
-            if disc is not None:
-                success = rip_disc(disc, device, args.output, logfile)
-                eject_disc(device)
-                sys.exit(0 if success else 1)
-
-        log("No disc found in any drive.", logfile)
-        sys.exit(1)
-
-    # Initialize drive states and display
-    for device in devices:
-        _drive_states[device] = DriveState(device=device)
-
-    _init_display(devices)
-
-    try:
-        if len(devices) == 1:
-            poll_and_rip(devices[0], args.output)
-        else:
-            threads = []
             for device in devices:
-                t = threading.Thread(
-                    target=poll_and_rip,
-                    args=(device, args.output),
-                    name=_device_label(device),
-                    daemon=True,
-                )
-                t.start()
-                threads.append(t)
+                disc = read_disc(device)
+                if disc is not None:
+                    success = rip_disc(disc, device, args.output, logfile)
+                    eject_disc(device)
+                    sys.exit(0 if success else 1)
 
-            while not _shutdown and any(t.is_alive() for t in threads):
-                time.sleep(1)
-    finally:
-        _stop_display()
+            log("No disc found in any drive.", logfile)
+            sys.exit(1)
+
+        # Initialize drive states and display
+        for device in devices:
+            _drive_states[device] = DriveState(device=device)
+
+        _init_display(devices)
+
+        try:
+            if len(devices) == 1:
+                poll_and_rip(devices[0], args.output)
+            else:
+                threads = []
+                for device in devices:
+                    t = threading.Thread(
+                        target=poll_and_rip,
+                        args=(device, args.output),
+                        name=_device_label(device),
+                        daemon=True,
+                    )
+                    t.start()
+                    threads.append(t)
+
+                while not _shutdown and any(t.is_alive() for t in threads):
+                    time.sleep(1)
+        finally:
+            _stop_display()
 
 
 if __name__ == "__main__":
