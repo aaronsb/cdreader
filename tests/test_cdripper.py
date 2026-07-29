@@ -401,9 +401,34 @@ class TestLog:
 
         cdripper.log("ripping track", device="/dev/sr0")
 
-        assert any("ripping track" in line for line in drive_states["/dev/sr0"].get_logs())
+        (stamp, msg), = drive_states["/dev/sr0"].get_logs()
+        assert msg == "ripping track"
+        assert re.fullmatch(r"\d{2}:\d{2}:\d{2}", stamp)
         assert drive_states["/dev/sr1"].get_logs() == []
         assert capsys.readouterr().out == ""  # TUI owns the screen
+
+    def test_tui_entry_omits_the_device_prefix(self, monkeypatch, drive_states):
+        # The panel is already titled with the drive, so repeating [sr0] on
+        # every line just burns column width.
+        monkeypatch.setattr(cdripper, "_display_live", object())
+
+        cdripper.log("Disc detected", device="/dev/sr0")
+
+        (_, msg), = drive_states["/dev/sr0"].get_logs()
+        assert msg == "Disc detected"
+        assert "sr0" not in msg
+
+    def test_tui_stamp_is_time_only_but_logfile_keeps_the_date(
+            self, monkeypatch, drive_states, tmp_path):
+        monkeypatch.setattr(cdripper, "_display_live", object())
+        path = tmp_path / "cdripper.log"
+
+        cdripper.log("Disc detected", logfile=str(path), device="/dev/sr0")
+
+        (stamp, _), = drive_states["/dev/sr0"].get_logs()
+        assert re.fullmatch(r"\d{2}:\d{2}:\d{2}", stamp)   # TUI: time only
+        assert re.match(r"^\[\d{4}-\d{2}-\d{2} ", path.read_text())  # file: full date
+        assert "[sr0]" in path.read_text()  # file keeps the prefix
 
     def test_broadcasts_to_every_drive_when_no_device_is_given(
             self, monkeypatch, drive_states):
@@ -412,7 +437,7 @@ class TestLog:
         cdripper.log("global notice")
 
         for state in drive_states.values():
-            assert any("global notice" in line for line in state.get_logs())
+            assert [msg for _, msg in state.get_logs()] == ["global notice"]
 
     def test_still_writes_the_logfile_while_the_display_is_active(
             self, monkeypatch, drive_states, tmp_path):
@@ -422,6 +447,105 @@ class TestLog:
         cdripper.log("recorded", logfile=str(path), device="/dev/sr0")
 
         assert "recorded" in path.read_text()
+
+
+# --- log rendering (issue #11) ---
+
+class TestWrapLogEntries:
+    def test_short_entry_is_one_row_carrying_its_stamp(self):
+        rows = cdripper._wrap_log_entries([("09:01:02", "Disc detected")], width=40)
+        assert rows == [("09:01:02", "Disc detected")]
+
+    def test_long_entry_wraps_with_continuation_rows_having_no_stamp(self):
+        entry = [("09:01:52", "Ripping Track 01/10: I'm Gonna Laugh You Right Out of My Life")]
+        rows = cdripper._wrap_log_entries(entry, width=40)
+
+        assert len(rows) > 1
+        assert rows[0][0] == "09:01:52"
+        assert all(stamp == "" for stamp, _ in rows[1:])
+
+    def test_wrapped_text_fits_the_column_once_the_gutter_is_accounted_for(self):
+        entry = [("09:01:52", "Ripping Track 01/10: I'm Gonna Laugh You Right Out of My Life")]
+        width = 40
+        rows = cdripper._wrap_log_entries(entry, width=width)
+
+        # every rendered row is "HH:MM:SS " + body, so body must fit what's left
+        for _, body in rows:
+            assert len(body) <= width - cdripper.LOG_STAMP_WIDTH - 1
+
+    def test_no_text_is_lost_when_wrapping(self):
+        msg = "Ripping Track 01/10: I'm Gonna Laugh You Right Out of My Life"
+        rows = cdripper._wrap_log_entries([("09:01:52", msg)], width=40)
+
+        assert " ".join(body for _, body in rows) == msg
+
+    def test_a_token_longer_than_the_column_is_broken_rather_than_overflowing(self):
+        # disc IDs are ~28 unbroken chars and used to blow out narrow columns
+        disc_id = "6xBbWPviuVg90s7R07rUU6WfdMo-"
+        rows = cdripper._wrap_log_entries([("09:01:51", disc_id)], width=24)
+
+        for _, body in rows:
+            assert len(body) <= 24 - cdripper.LOG_STAMP_WIDTH - 1
+
+    def test_entries_are_flattened_in_order(self):
+        rows = cdripper._wrap_log_entries(
+            [("09:00:01", "first"), ("09:00:02", "second")], width=40)
+        assert rows == [("09:00:01", "first"), ("09:00:02", "second")]
+
+    def test_empty_message_still_produces_a_row(self):
+        assert cdripper._wrap_log_entries([("09:00:01", "")], width=40) == [("09:00:01", "")]
+
+    def test_absurdly_narrow_column_does_not_hang_or_crash(self):
+        rows = cdripper._wrap_log_entries([("09:00:01", "some message here")], width=2)
+        assert rows  # floor on available width keeps textwrap sane
+
+    def test_no_entries_yields_no_rows(self):
+        assert cdripper._wrap_log_entries([], width=40) == []
+
+
+class TestLogStyle:
+    @pytest.mark.parametrize("msg", [
+        "  ERROR on Track 03/10: rip failed, retrying...",
+        "  FAILED Track 03/10 after 3 attempts",
+        "No MusicBrainz match. Using disc ID for folder name.",
+    ])
+    def test_problems_are_red(self, msg):
+        assert cdripper._log_style(msg) == "red"
+
+    @pytest.mark.parametrize("msg", [
+        "  Track 01/10: Trust in Me done (0m39s)",
+        "Rip complete. Ejecting.",
+        "Found: Holly Cole Trio - Blame It on My Youth",
+    ])
+    def test_good_news_is_green(self, msg):
+        assert cdripper._log_style(msg) == "green"
+
+    @pytest.mark.parametrize("msg", [
+        "  Ripping Track 01/10: Trust in Me",
+        "Disc detected",
+        "Looking up metadata on MusicBrainz...",
+    ])
+    def test_ordinary_progress_is_unstyled(self, msg):
+        assert cdripper._log_style(msg) == ""
+
+    @pytest.mark.parametrize("title", [
+        "Done Deal",
+        "What's Done Is Done",
+        "Error of My Ways",
+        "Complete Control",
+        "Failed by Design",
+    ])
+    def test_status_words_inside_a_track_title_do_not_leak_into_the_style(self, title):
+        # Track titles are user data. A rip that is only *starting* must not
+        # render as finished (green) or failed (red) because of its name.
+        assert cdripper._log_style(f"  Ripping Track 07/10: {title}") == ""
+
+    def test_a_completion_is_still_green_when_the_title_contains_a_status_word(self):
+        assert cdripper._log_style("  Track 07/10: Done Deal done (0m41s)") == "green"
+
+    def test_a_failure_is_still_red_when_the_title_contains_a_status_word(self):
+        assert cdripper._log_style(
+            "  FAILED Track 07/10: Done Deal after 3 attempts: boom") == "red"
 
 
 # --- check_dependencies ---
@@ -466,24 +590,30 @@ class TestDriveState:
     def test_log_buffer_is_bounded_and_keeps_newest(self):
         ds = cdripper.DriveState(device="/dev/sr0")
         for i in range(cdripper.LOG_BUFFER_LINES + 25):
-            ds.add_log(f"line {i}")
+            ds.add_log("09:01:02", f"line {i}")
 
         logs = ds.get_logs()
         assert len(logs) == cdripper.LOG_BUFFER_LINES
-        assert logs[-1] == f"line {cdripper.LOG_BUFFER_LINES + 24}"
+        assert logs[-1] == ("09:01:02", f"line {cdripper.LOG_BUFFER_LINES + 24}")
+
+    def test_entries_are_stored_as_stamp_message_pairs(self):
+        ds = cdripper.DriveState(device="/dev/sr0")
+        ds.add_log("09:01:02", "Disc detected")
+
+        assert ds.get_logs() == [("09:01:02", "Disc detected")]
 
     def test_get_logs_returns_a_copy_not_the_live_buffer(self):
         ds = cdripper.DriveState(device="/dev/sr0")
-        ds.add_log("first")
+        ds.add_log("09:01:02", "first")
         logs = ds.get_logs()
-        ds.add_log("second")
+        ds.add_log("09:01:03", "second")
 
-        assert logs == ["first"]
+        assert logs == [("09:01:02", "first")]
 
     def test_each_instance_has_its_own_log_buffer(self):
         a = cdripper.DriveState(device="/dev/sr0")
         b = cdripper.DriveState(device="/dev/sr1")
-        a.add_log("only in a")
+        a.add_log("09:01:02", "only in a")
 
         assert b.get_logs() == []
 

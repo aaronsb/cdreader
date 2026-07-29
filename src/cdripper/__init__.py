@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from collections import deque
@@ -62,6 +63,9 @@ LOG_BUFFER_LINES = 50
 # Minimum width per log column before switching to vertical stack
 MIN_LOG_COL_WIDTH = 40
 
+# Width of the "HH:MM:SS" gutter in the TUI log panels
+LOG_STAMP_WIDTH = 8
+
 
 # --- Drive state for TUI ---
 
@@ -88,9 +92,10 @@ class DriveState:
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
-    def add_log(self, msg):
+    def add_log(self, stamp, msg):
+        """Buffer one log entry as (HH:MM:SS, message) for the display thread."""
         with self.lock:
-            self.log_lines.append(msg)
+            self.log_lines.append((stamp, msg))
 
     def get_logs(self):
         with self.lock:
@@ -190,30 +195,65 @@ def _init_display(devices):
 
             sorted_devices = sorted(_drive_states)
 
+            def log_body(ds, inner_width, inner_height, placeholder):
+                """Render one drive's buffer: dim gutter, hanging-indented wraps.
+
+                Entries are wrapped *before* the height cut, so the panel shows
+                the last N rendered lines rather than the last N entries -- the
+                latter overflows whenever anything wraps.
+                """
+                entries = ds.get_logs()
+                if not entries:
+                    return Text(placeholder, style="dim")
+
+                rows = _wrap_log_entries(entries, inner_width)[-inner_height:]
+                text = Text()
+                for i, (stamp, body) in enumerate(rows):
+                    if i:
+                        text.append("\n")
+                    if stamp:
+                        text.append(f"{stamp} ", style="dim")
+                    else:
+                        text.append(" " * (LOG_STAMP_WIDTH + 1))
+                    text.append(body, style=_log_style(body))
+                return text
+
+            # Panel chrome: 2 border columns + 2 padding columns
+            panel_chrome = 4
+            term_width = console.width or 80
+
             if drive_count == 1:
                 ds = _drive_states[sorted_devices[0]]
-                visible = ds.get_logs()[-log_inner_height:]
-                log_text = Text("\n".join(visible)) if visible else Text(
-                    "Waiting for activity...", style="dim")
-                log_panel = Panel(log_text, title=f"Log [{ds.label}]",
-                                  border_style="dim")
+                log_panel = Panel(
+                    log_body(ds, term_width - panel_chrome, log_inner_height,
+                             "Waiting for activity..."),
+                    title=f"Log [{ds.label}]", border_style="dim",
+                )
             else:
-                # Build per-drive panels
+                # Horizontal columns unless too narrow, then stack vertically.
+                # Decide first: it determines how wide each panel actually is,
+                # and so how the text inside it must be wrapped.
+                col_width = term_width // drive_count
+                side_by_side = col_width >= MIN_LOG_COL_WIDTH
+                inner = max((col_width if side_by_side else term_width)
+                            - panel_chrome, 12)
+                # Side by side each panel gets the full height; stacked, they
+                # split it, and each one's own two border lines come out of
+                # its share.
+                inner_h = (log_inner_height if side_by_side
+                           else max(log_inner_height // drive_count - 2, 3))
+
                 panels = []
                 for device in sorted_devices:
                     ds = _drive_states[device]
-                    visible = ds.get_logs()[-log_inner_height:]
-                    log_text = Text("\n".join(visible)) if visible else Text(
-                        "Waiting...", style="dim")
                     panels.append(Layout(
-                        Panel(log_text, title=ds.label, border_style="cyan"),
+                        Panel(log_body(ds, inner, inner_h, "Waiting..."),
+                              title=ds.label, border_style="cyan"),
                         name=ds.label,
                     ))
 
-                # Horizontal columns unless too narrow, then stack vertically
                 log_area = Layout(name="logs")
-                col_width = (console.width or 80) // drive_count
-                if col_width >= MIN_LOG_COL_WIDTH:
+                if side_by_side:
                     log_area.split_row(*panels)
                 else:
                     log_area.split_column(*panels)
@@ -311,18 +351,65 @@ def _device_label(device):
     return os.path.basename(device)
 
 
+# Anchored to the shapes log() is actually called with. Deliberately not
+# substring matches: track titles are user data and contain words like "Done"
+# and "Error", which would otherwise style a starting rip as a finished one.
+_LOG_BAD_PREFIXES = (
+    "error", "failed", "drive error", "rip failed",
+    "musicbrainz lookup failed", "no musicbrainz match",
+)
+_LOG_GOOD_PREFIXES = ("found:", "rip complete", "album written")
+_LOG_DONE_SUFFIX = re.compile(r"\bdone \(\d+m\d{2}s\)$")
+
+
+def _log_style(msg):
+    """Pick a rich style from the shape of a message this program emits."""
+    text = msg.strip()
+    low = text.lower()
+    if low.startswith(_LOG_BAD_PREFIXES):
+        return "red"
+    if low.startswith(_LOG_GOOD_PREFIXES) or _LOG_DONE_SUFFIX.search(text):
+        return "green"
+    return ""
+
+
+def _wrap_log_entries(entries, width, stamp_width=LOG_STAMP_WIDTH):
+    """Flatten (stamp, message) entries into display rows wrapped to `width`.
+
+    Returns a list of (stamp, text) rows. Continuation rows carry an empty
+    stamp so the renderer indents them under the message, which is what makes
+    a wrapped title read as one entry rather than two.
+    """
+    avail = max(width - stamp_width - 1, 12)
+    rows = []
+    for stamp, msg in entries:
+        wrapped = textwrap.wrap(msg, width=avail) or [""]
+        rows.append((stamp, wrapped[0]))
+        rows.extend(("", cont) for cont in wrapped[1:])
+    return rows
+
+
 def log(msg, logfile=None, device=None):
-    """Print timestamped message and optionally append to logfile."""
+    """Print timestamped message and optionally append to logfile.
+
+    The on-disk log and plain stdout keep the full date and the [srN] prefix,
+    since both are read outside any per-drive context. The TUI drops both: its
+    panels are already titled with the drive, and a full ISO timestamp on every
+    line costs more than half the usable width of a narrow column.
+    """
+    now = time.localtime()
     prefix = f"[{_device_label(device)}] " if device else ""
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {prefix}{msg}"
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S', now)}] {prefix}{msg}"
     with _log_lock:
         if _display_live:
+            stamp = time.strftime("%H:%M:%S", now)
             # Route to per-drive log buffer (rendered by the TUI refresh loop)
             if device and device in _drive_states:
-                _drive_states[device].add_log(line)
+                _drive_states[device].add_log(stamp, msg)
             elif _drive_states:
+                # No owning drive: broadcast, keeping the prefix to disambiguate
                 for ds in _drive_states.values():
-                    ds.add_log(line)
+                    ds.add_log(stamp, f"{prefix}{msg}")
         else:
             print(line, flush=True)
         if logfile:
