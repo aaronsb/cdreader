@@ -61,8 +61,30 @@ systemctl --user enable --now cdripper
     └── cdripper.log
 ```
 
+Multi-disc releases put every disc in the **one album directory**, with the
+disc number prefixed onto the track number:
+
+```
+~/Music/
+└── Ani DiFranco/
+    └── Rome_ Italy 11.15.04/
+        ├── 1-01 - Swan Dive.flac
+        ├── 1-02 - Educated Guess.flac
+        ├── 2-01 - Nicotine.flac
+        ├── 2-02 - Bubble.flac
+        ├── Ani DiFranco - Rome_ Italy 11.15.04.m3u   # spans both discs
+        ├── album_info_disc1.txt
+        └── album_info_disc2.txt
+```
+
+This matches MusicBrainz Picard's default naming, and keeps the release as a
+single album in Plex, Jellyfin and Navidrome — separate `Disc 1`/`Disc 2`
+album folders make players show one release as two. `DISCNUMBER`, `DISCTOTAL`
+and (where MusicBrainz has one) `DISCSUBTITLE` are written to every file, which
+is what media servers actually group on. Single-disc albums are unaffected.
+
 - FLAC files at max compression (`flac -8`) with full Vorbis tags
-- `album_info.txt` has all metadata in `KEY=value` format, including `FAILED_TRACKS` for any tracks that couldn't be ripped
+- `album_info.txt` has all metadata in `KEY=value` format, including `FAILED_TRACKS` for any tracks that couldn't be ripped. Multi-disc releases get one `album_info_discN.txt` per disc, since the disc ID and track count differ per disc
 - `.m3u` playlist for each album
 - Filenames sanitized: special characters become `_`
 - Desktop notifications on GNOME/KDE for rip progress and errors
