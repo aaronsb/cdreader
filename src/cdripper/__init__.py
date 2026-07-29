@@ -479,13 +479,22 @@ def lookup_metadata(disc, logfile=None, device=None):
     date = release.get("date", "")
 
     media = release.get("medium-list", [])
-    matched = _match_medium(media, disc.id)
+    matched, exact = _match_medium(media, disc.id)
     if matched is None:
         return None
 
     tracks = _extract_tracks(matched, album_artist)
     if not tracks:
+        # A medium that matched but carries no track list tells us nothing
+        # useful. Better to rip under the disc ID than to label this disc with
+        # some other disc's titles.
+        log(f"Release '{album}' has no track list for this disc.", logfile, device)
         return None
+
+    if not exact and len(media) > 1:
+        log(f"Disc ID not listed on any medium of '{album}' ({len(media)} discs). "
+            f"Assuming disc 1 -- check DISCNUMBER before filing these.",
+            logfile, device)
 
     is_va = album_artist.lower() in ("various artists", "various")
 
@@ -497,18 +506,23 @@ def lookup_metadata(disc, logfile=None, device=None):
         "is_va": is_va,
         "disc_id": disc.id,
         "disc_number": _medium_position(matched, media),
-        "disc_total": len(media) or 1,
+        "disc_total": len(media),
         "disc_subtitle": matched.get("title", ""),
     }
 
 
 def _match_medium(media, disc_id):
-    """Find the medium carrying this disc ID, falling back to the first one."""
+    """Find the medium carrying this disc ID.
+
+    Returns (medium, exact). `exact` is False when nothing matched and the
+    first medium was substituted, because on a multi-disc release that means
+    any disc number we report is a guess.
+    """
     for medium in media:
         for disc_entry in medium.get("disc-list", []):
             if disc_entry.get("id") == disc_id:
-                return medium
-    return media[0] if media else None
+                return medium, True
+    return (media[0], False) if media else (None, False)
 
 
 def _medium_position(medium, media):
@@ -711,7 +725,12 @@ def write_playlist(album_dir, metadata, failed_tracks=None):
 
     entries = []
     if metadata.get("disc_total", 1) > 1 and m3u_path.exists():
-        entries = [ln for ln in m3u_path.read_text().splitlines() if ln.strip()]
+        # Keep other discs' entries, but drop this disc's: the rip we are
+        # finishing is authoritative for it. Merging blindly would strand a
+        # line pointing at a track that just failed and had its FLAC deleted.
+        own = f"{metadata.get('disc_number', 1)}-"
+        entries = [ln for ln in m3u_path.read_text().splitlines()
+                   if ln.strip() and not ln.startswith(own)]
 
     for track in metadata["tracks"]:
         if failed_tracks and track["number"] in failed_tracks:

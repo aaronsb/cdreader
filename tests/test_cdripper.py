@@ -325,6 +325,43 @@ class TestMultiDiscLookup:
         meta = cdripper.lookup_metadata(SimpleNamespace(id="NOT-IN-RELEASE"))
         assert meta["disc_number"] == 1
 
+    def test_the_guess_is_reported_rather_than_asserted_silently(
+            self, monkeypatch, capsys):
+        # Falling back means the disc number is a guess; on a multi-disc
+        # release that would otherwise be written into tags as if it were fact.
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: _mb_multidisc("DISC-ONE"))
+
+        cdripper.lookup_metadata(SimpleNamespace(id="NOT-IN-RELEASE"))
+
+        out = capsys.readouterr().out
+        assert "Disc ID not listed" in out and "2 discs" in out
+
+    def test_no_warning_when_the_disc_id_matched(self, monkeypatch, capsys):
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: _mb_multidisc("DISC-TWO"))
+
+        cdripper.lookup_metadata(SimpleNamespace(id="DISC-TWO"))
+        assert "Disc ID not listed" not in capsys.readouterr().out
+
+    def test_no_warning_on_an_ordinary_single_disc_release(self, monkeypatch, capsys):
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: _mb_response())
+
+        cdripper.lookup_metadata(SimpleNamespace(id="SOMETHING-ELSE"))
+        assert "Disc ID not listed" not in capsys.readouterr().out
+
+    def test_matched_medium_with_no_track_list_is_treated_as_no_match(
+            self, monkeypatch):
+        # Rather than fall through to another disc's titles, which would label
+        # this disc with the wrong track names.
+        payload = _mb_multidisc("DISC-ONE")
+        payload["disc"]["release-list"][0]["medium-list"][0]["track-list"] = []
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: payload)
+
+        assert cdripper.lookup_metadata(SimpleNamespace(id="DISC-ONE")) is None
+
 
 class TestMultiDiscFilenames:
     def test_track_numbers_are_disc_prefixed_on_multi_disc_releases(self):
@@ -571,6 +608,28 @@ class TestMultiDiscSharedDirectory:
         assert "Nicotine" not in content
         assert "2-02 - Bubble.flac" in content
         assert "1-01 - Swan Dive.flac" in content  # disc 1 untouched
+
+    def test_re_rip_drops_an_entry_whose_track_now_fails(self, tmp_path):
+        # rip_disc deletes the FLAC of a track that fails, so leaving its line
+        # in the playlist would point at a file that is no longer there.
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_playlist(tmp_path, _disc_metadata(2, 2, DISC2))
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1), failed_tracks={1})
+
+        lines = (tmp_path / M3U_NAME).read_text().splitlines()
+        assert "1-01 - Swan Dive.flac" not in lines   # failed, file deleted
+        assert "1-02 - Educated Guess.flac" in lines  # still fine
+        assert "2-01 - Nicotine.flac" in lines        # other disc untouched
+        assert "2-02 - Bubble.flac" in lines
+
+    def test_re_rip_of_one_disc_leaves_the_other_disc_alone(self, tmp_path):
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_playlist(tmp_path, _disc_metadata(2, 2, DISC2))
+        before = (tmp_path / M3U_NAME).read_text().splitlines()
+
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+
+        assert (tmp_path / M3U_NAME).read_text().splitlines() == before
 
     def test_single_disc_playlist_is_replaced_not_merged(self, tmp_path, metadata):
         # a re-rip of a normal album should not accumulate stale entries
