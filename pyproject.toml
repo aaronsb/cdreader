@@ -16,6 +16,14 @@ dependencies = [
     "rich",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff",
+    "build",
+]
+
 [project.scripts]
 cdripper = "cdripper:main"
 
@@ -28,3 +36,28 @@ local_scheme = "no-local-version"
 
 [project.urls]
 Homepage = "https://github.com/aaronsb/cdreader"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+]
+ignore = [
+    "B008",  # function call in default arg -- not a pattern used here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]  # long assertion lines are fine in tests

@@ -7,17 +7,17 @@ tags with MusicBrainz metadata, and organizes into Artist/Album/ directories.
 """
 
 import argparse
-from collections import deque
+import contextlib
 import os
 import re
 import shutil
 import signal
-import contextlib
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from glob import glob
 from importlib.metadata import version as pkg_version
@@ -122,12 +122,12 @@ def _init_display(devices):
         return
 
     try:
-        from rich.live import Live
-        from rich.table import Table
-        from rich.text import Text
         from rich.console import Console
         from rich.layout import Layout
+        from rich.live import Live
         from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
 
         console = Console()
 
@@ -473,7 +473,8 @@ def rip_and_encode(device, track_num, output_path, logfile=None, track_label="",
             if dt > 0:
                 bps = (current_size - last_size) / dt
                 speed = bps / CD_1X_BPS
-                progress = min(current_size / expected_wav_size, 1.0) if expected_wav_size > 0 else 0.0
+                progress = (min(current_size / expected_wav_size, 1.0)
+                            if expected_wav_size > 0 else 0.0)
                 if drive_state:
                     drive_state.update(speed=speed, track_progress=progress)
             last_size = current_size
@@ -570,9 +571,10 @@ def write_playlist(album_dir, metadata, failed_tracks=None):
 def _track_filename(track, metadata):
     """Build the FLAC filename for a track."""
     num = f"{track['number']:02d}"
+    title = sanitize_filename(track["title"])
     if metadata["is_va"]:
-        return f"{num} - {sanitize_filename(track['artist'])} - {sanitize_filename(track['title'])}.flac"
-    return f"{num} - {sanitize_filename(track['title'])}.flac"
+        return f"{num} - {sanitize_filename(track['artist'])} - {title}.flac"
+    return f"{num} - {title}.flac"
 
 
 def eject_disc(device):
