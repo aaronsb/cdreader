@@ -54,6 +54,18 @@ false, so the TUI never activates under systemd or in a pipe. `--once` skips it
 entirely. Any TUI change must keep the non-TTY path working — that's how the
 systemd user service runs.
 
+**Metadata sidecar.** Every rip writes a `metadata.toml` next to the FLACs.
+`cdripper apply` reads it back and re-tags, renames, and relocates the album.
+The round trip is the contract: anything `write_metadata_toml` emits,
+`read_metadata_toml` must accept, and `metadata_from_flacs` must be able to
+rebuild from tags alone. Adding a field means touching all three plus
+`EXTRA_ALBUM_FIELDS`.
+
+TOML is written by hand rather than through a library, because the file is
+meant to be read and edited by a person and carries explanatory comments.
+Reading uses `tomllib` (3.11+) or the `tomli` backport. Escape anything
+user-supplied through `_toml_str`.
+
 ## Gotchas
 
 - **`import discid` fails without libdiscid.** It's a ctypes binding to a system

@@ -37,6 +37,43 @@ cdripper -o /mnt/nas/music          # custom output directory
 cdripper --once                     # rip one disc and exit
 ```
 
+### Fixing metadata by hand
+
+Every rip drops a `metadata.toml` in the album directory, pre-filled with
+whatever was known. Edit it and apply it back:
+
+```bash
+cdripper apply ~/Music/Unknown\ Artist/xK9fL2mQpR7-   # re-tag, rename, relocate
+cdripper apply --in-place <dir>                       # re-tag without moving
+cdripper toml <dir>                                   # (re)generate from existing FLACs
+```
+
+Applying re-tags every FLAC, renames files whose titles changed, rewrites
+`album_info.txt` and the playlist, and moves the album directory when the
+artist or album name changed. So a disc MusicBrainz has never heard of goes
+from `Unknown Artist/xK9fL2mQpR7-/01 - Track 01.flac` to
+`The Weather Station/Live at Massey Hall/01 - Robber.flac` in one step.
+
+It works on **every** rip, not just unmatched discs — a MusicBrainz-matched
+album can be corrected or annotated the same way. `cdripper toml` brings rips
+made before this existed into the same loop by rebuilding the file from the
+tags already on disk.
+
+Alongside the usual fields, the sidecar carries ones aimed at recordings
+MusicBrainz doesn't have — soundboards, live sets, school concerts:
+
+| Field | Vorbis tag | For |
+|---|---|---|
+| `performer` | `PERFORMER` | who played, when there's no "artist" in the release sense |
+| `engineer` | `ENGINEER` | audio engineer |
+| `recorded` | `RECORDINGDATE` | when it was recorded, as distinct from released |
+| `venue` | `LOCATION` | where |
+| `genre` | `GENRE` | |
+| `notes` | `DESCRIPTION` | free text |
+
+Multi-disc albums get one sidecar per disc (`metadata_disc1.toml`, …);
+`cdripper apply` on the directory handles all of them.
+
 To auto-start on login:
 
 ```bash
