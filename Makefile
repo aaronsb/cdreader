@@ -2,18 +2,21 @@
 #
 # Quick start:  make dev && make test
 # Everything runs inside .venv -- no global installs, no sudo (except `make deps`).
+#
+# PY and RUFF can be overridden to use an interpreter that is already on PATH,
+# which is how CI runs these targets:  make test PY=python
 
 VENV    := .venv
-PY      := $(VENV)/bin/python
-PYTEST  := $(PY) -m pytest
-RUFF    := $(VENV)/bin/ruff
+PY       = $(VENV)/bin/python
+RUFF     = $(VENV)/bin/ruff
+PYTEST   = $(PY) -m pytest
 UV      := $(shell command -v uv 2>/dev/null)
 
 # Version comes from the latest git tag via setuptools-scm.
 CURRENT_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
 
 .DEFAULT_GOAL := help
-.PHONY: help dev deps test test-cov lint fmt check run once clean distclean build tag
+.PHONY: help require-dev dev deps test test-cov lint fmt check run once clean distclean build tag
 
 help: ## Show this help
 	@echo "cdripper -- development tasks"
@@ -23,11 +26,24 @@ help: ## Show this help
 	@echo ""
 	@echo "Current version: $(CURRENT_VERSION)"
 
+# Fail with a useful message rather than a bare exit 127.
+require-dev:
+	@command -v $(PY) >/dev/null 2>&1 \
+		|| { echo "No Python environment found. Run 'make dev' first."; exit 1; }
+	@command -v $(RUFF) >/dev/null 2>&1 \
+		|| { echo "Dev tools not installed. Run 'make dev' first."; exit 1; }
+
 $(VENV):
 ifdef UV
 	$(UV) venv $(VENV)
 else
-	python3 -m venv $(VENV)
+	@python3 -m venv $(VENV) || { \
+		echo ""; \
+		echo "Could not create a virtualenv. Either install uv:"; \
+		echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+		echo "or install your distro's venv package, e.g.:"; \
+		echo "    sudo apt install python3-venv"; \
+		exit 1; }
 endif
 
 dev: $(VENV) ## Create venv and install the package + dev tools (editable)
@@ -45,34 +61,44 @@ deps: ## Install the system packages cdripper shells out to (needs sudo)
 	 elif command -v dnf    >/dev/null; then sudo dnf install -y cdparanoia flac libdiscid eject; \
 	 else echo "Unknown package manager -- install cdparanoia, flac, libdiscid, eject by hand."; exit 1; fi
 
-test: ## Run the unit tests
+test: require-dev ## Run the unit tests
 	$(PYTEST) tests/ -q
 
-test-cov: ## Run tests with a coverage report
+test-cov: require-dev ## Run tests with a coverage report
 	$(PYTEST) tests/ --cov=cdripper --cov-report=term-missing
 
-lint: ## Check style and common errors
+lint: require-dev ## Check style and common errors
 	$(RUFF) check src/ tests/
 
-fmt: ## Auto-fix what ruff can fix
+fmt: require-dev ## Auto-fix what ruff can fix
 	$(RUFF) check --fix src/ tests/
 
+# Deliberately has no require-dev guard: this is the target you run *because*
+# something is broken, so every probe degrades to a message instead of failing.
 check: ## Verify the runtime environment (system binaries + python imports)
 	@echo "System binaries:"
 	@for b in cdparanoia flac eject; do \
 		printf "  %-12s " "$$b"; \
-		command -v $$b >/dev/null && echo "ok" || echo "MISSING"; \
+		command -v $$b >/dev/null && echo "ok" || echo "MISSING -- run 'make deps'"; \
 	done
+	@printf "Python env:    "
+	@command -v $(PY) >/dev/null 2>&1 && echo "ok ($(PY))" || echo "MISSING -- run 'make dev'"
 	@echo "Python imports:"
-	@$(PY) -c "import discid, musicbrainzngs, mutagen, rich; print('  all ok')" \
-		|| echo "  MISSING -- run 'make dev' (and 'make deps' for libdiscid)"
-	@echo "Optical drives detected:"
-	@$(PY) -c "import cdripper; d=cdripper.detect_drives(); print('  ' + (', '.join(d) if d else 'none'))"
+	@command -v $(PY) >/dev/null 2>&1 \
+		&& { $(PY) -c "import discid, musicbrainzngs, mutagen, rich; print('  all ok')" \
+			|| echo "  FAILED -- run 'make dev' (and 'make deps' if libdiscid is missing)"; } \
+		|| echo "  skipped (no python env)"
+	@echo "Optical drives:"
+	@command -v $(PY) >/dev/null 2>&1 \
+		&& { $(PY) -c "import cdripper; d = cdripper.detect_drives(); \
+			print('  ' + (', '.join(d) if d else 'none detected'))" \
+			|| echo "  unknown -- cdripper is not importable"; } \
+		|| echo "  skipped (no python env)"
 
-run: ## Run cdripper against all detected drives
+run: require-dev ## Run cdripper against all detected drives
 	$(VENV)/bin/cdripper
 
-once: ## Rip a single disc and exit
+once: require-dev ## Rip a single disc and exit
 	$(VENV)/bin/cdripper --once
 
 build: clean ## Build the wheel and sdist
@@ -84,13 +110,17 @@ endif
 
 tag: ## Tag a release: make tag V=0.4.0
 	@test -n "$(V)" || { echo "Usage: make tag V=0.4.0"; exit 1; }
+	@echo "$(V)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-.].+)?$$' \
+		|| { echo "V must look like 0.4.0 -- no leading 'v' (got '$(V)')."; exit 1; }
+	@git rev-parse -q --verify "refs/tags/v$(V)" >/dev/null \
+		&& { echo "Tag v$(V) already exists."; exit 1; } || true
 	@git diff --quiet && git diff --cached --quiet \
 		|| { echo "Working tree is dirty -- commit or stash first."; exit 1; }
 	@test "$$(git rev-parse --abbrev-ref HEAD)" = "main" \
 		|| { echo "Tag from main, not $$(git rev-parse --abbrev-ref HEAD)."; exit 1; }
 	@git fetch origin main --quiet && git diff --quiet HEAD origin/main \
 		|| { echo "Local main differs from origin/main -- pull first."; exit 1; }
-	$(MAKE) test
+	$(MAKE) lint test
 	git tag -a "v$(V)" -m "Release v$(V)"
 	git push origin "v$(V)"
 	@echo "Tagged v$(V) (was $(CURRENT_VERSION))."
@@ -98,7 +128,8 @@ tag: ## Tag a release: make tag V=0.4.0
 clean: ## Remove build artifacts and caches
 	rm -rf build/ dist/ *.egg-info src/*.egg-info
 	rm -rf .pytest_cache .ruff_cache .coverage htmlcov
-	find . -type d -name __pycache__ -prune -exec rm -rf {} +
+	@find . -path ./$(VENV) -prune -o -path ./.git -prune -o \
+		-type d -name __pycache__ -print0 | xargs -0 -r rm -rf
 
 distclean: clean ## Also remove the virtualenv
 	rm -rf $(VENV)

@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# This workflow only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,14 +33,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install project and dev tools
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # Driven through make so the Makefile stays exercised -- it is the
+      # documented contributor interface, and would otherwise rot unnoticed.
+      # PY/RUFF point at the runner's interpreter instead of a local .venv.
       - name: Lint
-        run: ruff check src/ tests/
+        run: make lint PY=python RUFF=ruff
 
       - name: Test
-        run: pytest tests/ -q
+        run: make test PY=python RUFF=ruff
+
+      - name: Environment report
+        run: make check PY=python

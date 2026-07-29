@@ -8,6 +8,7 @@ Anything that needs a real optical drive, cdparanoia, or the network is out of
 scope here -- those paths are exercised by `make check` and by ripping a disc.
 """
 
+import re
 import subprocess
 from types import SimpleNamespace
 
@@ -343,14 +344,84 @@ class TestDetectDrives:
         assert cdripper.detect_drives() == ["/dev/sr0", "/dev/sr1", "/dev/sr2"]
 
     def test_falls_back_to_dev_cdrom_when_no_sr_devices(self, monkeypatch):
+        # Patch narrowly: only /dev/cdrom is faked, everything else defers to
+        # the real os.path.exists so unrelated code is unaffected.
+        real_exists = cdripper.os.path.exists
         monkeypatch.setattr(cdripper, "glob", lambda p: [])
-        monkeypatch.setattr(cdripper.os.path, "exists", lambda p: p == "/dev/cdrom")
+        monkeypatch.setattr(cdripper.os.path, "exists",
+                            lambda p: True if p == "/dev/cdrom" else real_exists(p))
         assert cdripper.detect_drives() == ["/dev/cdrom"]
 
     def test_returns_empty_when_no_drives_exist(self, monkeypatch):
+        real_exists = cdripper.os.path.exists
         monkeypatch.setattr(cdripper, "glob", lambda p: [])
-        monkeypatch.setattr(cdripper.os.path, "exists", lambda p: False)
+        monkeypatch.setattr(cdripper.os.path, "exists",
+                            lambda p: False if p == "/dev/cdrom" else real_exists(p))
         assert cdripper.detect_drives() == []
+
+
+# --- log routing ---
+
+@pytest.fixture
+def drive_states(monkeypatch):
+    """Install a clean two-drive registry for the duration of a test."""
+    states = {d: cdripper.DriveState(device=d) for d in ("/dev/sr0", "/dev/sr1")}
+    monkeypatch.setattr(cdripper, "_drive_states", states)
+    return states
+
+
+class TestLog:
+    def test_prints_to_stdout_when_no_display_is_active(self, capsys):
+        cdripper.log("plain message")
+        assert "plain message" in capsys.readouterr().out
+
+    def test_line_is_timestamped(self, capsys):
+        cdripper.log("hello")
+        # leading [YYYY-MM-DD HH:MM:SS]
+        assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello",
+                        capsys.readouterr().out.strip())
+
+    def test_device_is_rendered_as_a_short_prefix(self, capsys):
+        cdripper.log("detected", device="/dev/sr1")
+        assert "[sr1] detected" in capsys.readouterr().out
+
+    def test_appends_each_call_to_the_logfile(self, tmp_path):
+        path = tmp_path / "cdripper.log"
+        cdripper.log("first", logfile=str(path))
+        cdripper.log("second", logfile=str(path))
+
+        lines = path.read_text().splitlines()
+        assert len(lines) == 2
+        assert lines[0].endswith("first")
+        assert lines[1].endswith("second")
+
+    def test_routes_to_the_owning_drive_buffer_when_display_is_active(
+            self, monkeypatch, drive_states, capsys):
+        monkeypatch.setattr(cdripper, "_display_live", object())
+
+        cdripper.log("ripping track", device="/dev/sr0")
+
+        assert any("ripping track" in line for line in drive_states["/dev/sr0"].get_logs())
+        assert drive_states["/dev/sr1"].get_logs() == []
+        assert capsys.readouterr().out == ""  # TUI owns the screen
+
+    def test_broadcasts_to_every_drive_when_no_device_is_given(
+            self, monkeypatch, drive_states):
+        monkeypatch.setattr(cdripper, "_display_live", object())
+
+        cdripper.log("global notice")
+
+        for state in drive_states.values():
+            assert any("global notice" in line for line in state.get_logs())
+
+    def test_still_writes_the_logfile_while_the_display_is_active(
+            self, monkeypatch, drive_states, tmp_path):
+        monkeypatch.setattr(cdripper, "_display_live", object())
+        path = tmp_path / "cdripper.log"
+
+        cdripper.log("recorded", logfile=str(path), device="/dev/sr0")
+
+        assert "recorded" in path.read_text()
 
 
 # --- check_dependencies ---
