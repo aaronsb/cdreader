@@ -238,9 +238,10 @@ def _init_display(devices):
                 inner = max((col_width if side_by_side else term_width)
                             - panel_chrome, 12)
                 # Side by side each panel gets the full height; stacked, they
-                # split it between them.
+                # split it, and each one's own two border lines come out of
+                # its share.
                 inner_h = (log_inner_height if side_by_side
-                           else max(log_inner_height // drive_count, 3))
+                           else max(log_inner_height // drive_count - 2, 3))
 
                 panels = []
                 for device in sorted_devices:
@@ -350,12 +351,24 @@ def _device_label(device):
     return os.path.basename(device)
 
 
+# Anchored to the shapes log() is actually called with. Deliberately not
+# substring matches: track titles are user data and contain words like "Done"
+# and "Error", which would otherwise style a starting rip as a finished one.
+_LOG_BAD_PREFIXES = (
+    "error", "failed", "drive error", "rip failed",
+    "musicbrainz lookup failed", "no musicbrainz match",
+)
+_LOG_GOOD_PREFIXES = ("found:", "rip complete", "album written")
+_LOG_DONE_SUFFIX = re.compile(r"\bdone \(\d+m\d{2}s\)$")
+
+
 def _log_style(msg):
-    """Pick a rich style for a log message based on what it reports."""
-    low = msg.lower()
-    if "error" in low or "failed" in low or "no musicbrainz match" in low:
+    """Pick a rich style from the shape of a message this program emits."""
+    text = msg.strip()
+    low = text.lower()
+    if low.startswith(_LOG_BAD_PREFIXES):
         return "red"
-    if "done" in low or "complete" in low or "found:" in low:
+    if low.startswith(_LOG_GOOD_PREFIXES) or _LOG_DONE_SUFFIX.search(text):
         return "green"
     return ""
 

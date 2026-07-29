@@ -528,6 +528,25 @@ class TestLogStyle:
     def test_ordinary_progress_is_unstyled(self, msg):
         assert cdripper._log_style(msg) == ""
 
+    @pytest.mark.parametrize("title", [
+        "Done Deal",
+        "What's Done Is Done",
+        "Error of My Ways",
+        "Complete Control",
+        "Failed by Design",
+    ])
+    def test_status_words_inside_a_track_title_do_not_leak_into_the_style(self, title):
+        # Track titles are user data. A rip that is only *starting* must not
+        # render as finished (green) or failed (red) because of its name.
+        assert cdripper._log_style(f"  Ripping Track 07/10: {title}") == ""
+
+    def test_a_completion_is_still_green_when_the_title_contains_a_status_word(self):
+        assert cdripper._log_style("  Track 07/10: Done Deal done (0m41s)") == "green"
+
+    def test_a_failure_is_still_red_when_the_title_contains_a_status_word(self):
+        assert cdripper._log_style(
+            "  FAILED Track 07/10: Done Deal after 3 attempts: boom") == "red"
+
 
 # --- check_dependencies ---
 
