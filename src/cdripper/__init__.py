@@ -27,6 +27,7 @@ from pathlib import Path
 
 import discid
 import musicbrainzngs
+from mutagen import MutagenError
 from mutagen.flac import FLAC
 
 try:
@@ -365,8 +366,16 @@ def _handle_signal(signum, frame):
 
 
 def sanitize_filename(name, max_length=200):
-    """Replace anything not [-a-zA-Z0-9_ .] with underscore, and truncate."""
+    """Replace anything not [-a-zA-Z0-9_ .] with underscore, and truncate.
+
+    Names made only of dots are neutralised too. Slashes already become
+    underscores, but "." and ".." would otherwise survive as real path
+    components -- and these values become directory names, so a metadata.toml
+    saying artist = ".." would place an album outside the library.
+    """
     sanitized = re.sub(r"[^-\w .]", "_", name)
+    if sanitized and set(sanitized) == {"."}:
+        sanitized = "_" * len(sanitized)
     if len(sanitized.encode("utf-8")) > max_length:
         truncated = sanitized.encode("utf-8")[:max_length].decode("utf-8", errors="ignore")
         sanitized = truncated.rstrip(" _-")
@@ -996,7 +1005,10 @@ def metadata_from_flacs(album_dir):
     tracks = []
     album_tags = None
     for flac_path in flacs:
-        tags = FLAC(str(flac_path))
+        try:
+            tags = FLAC(str(flac_path))
+        except MutagenError as e:
+            raise ValueError(f"{flac_path.name} is not readable as FLAC: {e}") from e
         if album_tags is None:
             album_tags = tags
         parsed = _parse_ripped_filename(flac_path.name)
@@ -1113,10 +1125,19 @@ def _remove_stale_sidecars(album_dir, metadata, logfile=None, keep_info=None):
 
 def _relocate_album(album_dir, metadata, logfile=None):
     """Move the album directory if artist or album changed. Returns the new path."""
-    target = (album_dir.parent.parent
+    library_root = album_dir.parent.parent
+    target = (library_root
               / sanitize_filename(metadata["artist"])
               / sanitize_filename(metadata["album"]))
     if target.resolve() == album_dir.resolve():
+        return album_dir
+
+    # Defence in depth: the sidecar is editable, and these values become
+    # directory names. Never write outside the library the album came from.
+    root = library_root.resolve()
+    if root not in target.resolve().parents:
+        log(f"Refusing to move outside {root}: artist/album resolve to {target}",
+            logfile)
         return album_dir
     if target.exists():
         log(f"Not moving: {target} already exists. Files updated in place.", logfile)
@@ -1368,7 +1389,7 @@ def _run_apply(paths, move=True):
         album_dir = Path(raw).expanduser()
         try:
             apply_metadata(album_dir, move=move)
-        except (ValueError, OSError) as e:
+        except (ValueError, OSError, MutagenError) as e:
             print(f"{album_dir}: {e}", file=sys.stderr)
             failures += 1
     return 1 if failures else 0
@@ -1386,7 +1407,7 @@ def _run_toml(paths, force=False):
             continue
         try:
             metadata = metadata_from_flacs(album_dir)
-        except (ValueError, OSError) as e:
+        except (ValueError, OSError, MutagenError) as e:
             print(f"{album_dir}: {e}", file=sys.stderr)
             failures += 1
             continue

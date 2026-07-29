@@ -1585,3 +1585,59 @@ def _edit_sidecar_named(album_dir, name, replacements):
         assert old in text, f"pattern not found in {name}: {old}"
         text = text.replace(old, new)
     path.write_text(text)
+
+
+# --- degenerate and hostile sidecar values ---
+
+class TestSanitizeFilenameTraversal:
+    @pytest.mark.parametrize("name", [".", "..", "..."])
+    def test_names_made_only_of_dots_are_neutralised(self, name):
+        # these become directory names; ".." would step outside the library
+        result = cdripper.sanitize_filename(name)
+        assert set(result) == {"_"}
+        assert len(result) == len(name)
+
+    def test_dots_elsewhere_in_a_name_are_untouched(self):
+        assert cdripper.sanitize_filename("Sgt. Pepper") == "Sgt. Pepper"
+        assert cdripper.sanitize_filename("...And Justice for All") \
+            == "...And Justice for All"
+
+    def test_separators_are_still_replaced(self):
+        assert "/" not in cdripper.sanitize_filename("../../etc/passwd")
+
+
+class TestApplyRefusesToEscapeTheLibrary:
+    def test_dot_dot_artist_cannot_move_the_album_out_of_the_library(
+            self, ripped_album):
+        library_root = ripped_album.parent.parent          # .../Music
+        outside = library_root.parent
+        before = sorted(p.name for p in outside.iterdir())
+
+        _edit_sidecar(ripped_album, [('artist      = "Unknown Artist"',
+                                      'artist      = ".."')])
+        result = cdripper.apply_metadata(ripped_album)
+
+        # landed somewhere inside the library, and nothing new appeared above it
+        assert library_root.resolve() in result.resolve().parents
+        assert sorted(p.name for p in outside.iterdir()) == before
+
+    def test_slashes_in_an_artist_name_do_not_create_directories(self, ripped_album):
+        _edit_sidecar(ripped_album, [('artist      = "Unknown Artist"',
+                                      'artist      = "AC/DC"')])
+        result = cdripper.apply_metadata(ripped_album)
+
+        assert result.parent.name == "AC_DC"
+
+
+class TestUnreadableFiles:
+    def test_toml_reports_a_corrupt_flac_instead_of_crashing(self, tmp_path, capsys):
+        (tmp_path / "01 - broken.flac").write_text("this is not a FLAC")
+
+        assert cdripper._run_toml([str(tmp_path)]) == 1
+        assert "not readable as FLAC" in capsys.readouterr().err
+
+    def test_metadata_from_flacs_raises_a_clear_error(self, tmp_path):
+        (tmp_path / "01 - broken.flac").write_text("this is not a FLAC")
+
+        with pytest.raises(ValueError, match="not readable as FLAC"):
+            cdripper.metadata_from_flacs(tmp_path)
