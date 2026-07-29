@@ -996,3 +996,648 @@ class TestTagFlac:
         meta["disc_subtitle"] = "The Acoustic Set"
         cdripper.tag_flac(flac_file, meta, meta["tracks"][0])
         assert FLAC(str(flac_file))["DISCSUBTITLE"] == ["The Acoustic Set"]
+
+
+# --- metadata.toml round trip (issue #13) ---
+
+def _sidecar_metadata(**overrides):
+    meta = {
+        "artist": "The Weather Station",
+        "album": "Live at Massey Hall",
+        "date": "2024-06-01",
+        "is_va": False,
+        "disc_id": "xK9fL2mQpR7-",
+        "disc_number": 1,
+        "disc_total": 1,
+        "disc_subtitle": "",
+        "tracks": [
+            {"number": 1, "title": "Robber", "artist": "The Weather Station"},
+            {"number": 2, "title": "Atlantic", "artist": "The Weather Station"},
+        ],
+    }
+    meta.update(overrides)
+    return meta
+
+
+class TestTomlString:
+    def test_quotes_are_escaped(self):
+        assert cdripper._toml_str('say "hi"') == '"say \\"hi\\""'
+
+    def test_backslashes_are_escaped(self):
+        assert cdripper._toml_str("a\\b") == '"a\\\\b"'
+
+    def test_newlines_and_tabs_are_escaped(self):
+        assert cdripper._toml_str("a\nb\tc") == '"a\\nb\\tc"'
+
+    def test_none_becomes_an_empty_string(self):
+        assert cdripper._toml_str(None) == '""'
+
+
+class TestWriteMetadataToml:
+    def test_writes_the_sidecar_and_returns_its_path(self, tmp_path):
+        path = cdripper.write_metadata_toml(tmp_path, _sidecar_metadata())
+
+        assert path == tmp_path / cdripper.METADATA_FILE
+        assert path.exists()
+
+    def test_output_is_parseable_toml(self, tmp_path):
+        cdripper.write_metadata_toml(tmp_path, _sidecar_metadata())
+        # must not raise
+        cdripper.read_metadata_toml(tmp_path / cdripper.METADATA_FILE)
+
+    def test_known_values_are_prefilled(self, tmp_path):
+        cdripper.write_metadata_toml(tmp_path, _sidecar_metadata())
+        parsed = cdripper.read_metadata_toml(tmp_path / cdripper.METADATA_FILE)
+
+        assert parsed["artist"] == "The Weather Station"
+        assert parsed["album"] == "Live at Massey Hall"
+        assert parsed["date"] == "2024-06-01"
+        assert [t["title"] for t in parsed["tracks"]] == ["Robber", "Atlantic"]
+
+    def test_extra_fields_are_present_and_blank_by_default(self, tmp_path):
+        cdripper.write_metadata_toml(tmp_path, _sidecar_metadata())
+        parsed = cdripper.read_metadata_toml(tmp_path / cdripper.METADATA_FILE)
+
+        for key in cdripper.EXTRA_ALBUM_FIELDS:
+            assert parsed[key] == ""
+
+    def test_extra_fields_survive_a_round_trip(self, tmp_path):
+        meta = _sidecar_metadata(performer="Tamara Lindeman", engineer="J. Rivera",
+                                 recorded="2024-03-14", venue="Massey Hall")
+        cdripper.write_metadata_toml(tmp_path, meta)
+        parsed = cdripper.read_metadata_toml(tmp_path / cdripper.METADATA_FILE)
+
+        assert parsed["performer"] == "Tamara Lindeman"
+        assert parsed["engineer"] == "J. Rivera"
+        assert parsed["recorded"] == "2024-03-14"
+        assert parsed["venue"] == "Massey Hall"
+
+    def test_titles_containing_quotes_round_trip(self, tmp_path):
+        meta = _sidecar_metadata(tracks=[
+            {"number": 1, "title": 'The "Real" Thing', "artist": "X"}])
+        cdripper.write_metadata_toml(tmp_path, meta)
+        parsed = cdripper.read_metadata_toml(tmp_path / cdripper.METADATA_FILE)
+
+        assert parsed["tracks"][0]["title"] == 'The "Real" Thing'
+
+    def test_multi_disc_values_round_trip(self, tmp_path):
+        meta = _sidecar_metadata(disc_number=2, disc_total=2, disc_subtitle="Encore")
+        path = cdripper.write_metadata_toml(tmp_path, meta)
+        parsed = cdripper.read_metadata_toml(path)
+
+        assert (parsed["disc_number"], parsed["disc_total"]) == (2, 2)
+        assert parsed["disc_subtitle"] == "Encore"
+
+    def test_multi_disc_sidecars_are_named_per_disc(self, tmp_path):
+        path = cdripper.write_metadata_toml(
+            tmp_path, _sidecar_metadata(disc_number=2, disc_total=2))
+        assert path.name == "metadata_disc2.toml"
+
+    def test_single_disc_sidecar_keeps_the_plain_name(self, tmp_path):
+        path = cdripper.write_metadata_toml(tmp_path, _sidecar_metadata())
+        assert path.name == cdripper.METADATA_FILE
+
+    def test_compilation_flag_round_trips(self, tmp_path):
+        cdripper.write_metadata_toml(tmp_path, _sidecar_metadata(is_va=True))
+        assert cdripper.read_metadata_toml(tmp_path / cdripper.METADATA_FILE)["is_va"] is True
+
+
+class TestReadMetadataToml:
+    def _write(self, tmp_path, body):
+        path = tmp_path / cdripper.METADATA_FILE
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_rejects_invalid_toml(self, tmp_path):
+        path = self._write(tmp_path, "[album\nartist = ")
+        with pytest.raises(ValueError, match="not valid TOML"):
+            cdripper.read_metadata_toml(path)
+
+    def test_rejects_empty_artist(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist=""\nalbum="A"\n[[track]]\nnumber=1\n')
+        with pytest.raises(ValueError, match="album.artist is empty"):
+            cdripper.read_metadata_toml(path)
+
+    def test_rejects_empty_album(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum=""\n[[track]]\nnumber=1\n')
+        with pytest.raises(ValueError, match="album.album is empty"):
+            cdripper.read_metadata_toml(path)
+
+    def test_rejects_a_file_with_no_tracks(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n')
+        with pytest.raises(ValueError, match="no .*track.* entries"):
+            cdripper.read_metadata_toml(path)
+
+    def test_rejects_duplicate_track_numbers(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n'
+                                     '[[track]]\nnumber=1\n[[track]]\nnumber=1\n')
+        with pytest.raises(ValueError, match="appears more than once"):
+            cdripper.read_metadata_toml(path)
+
+    def test_rejects_a_zero_or_negative_track_number(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n[[track]]\nnumber=0\n')
+        with pytest.raises(ValueError, match="must be 1 or greater"):
+            cdripper.read_metadata_toml(path)
+
+    def test_rejects_a_non_numeric_track_number(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n[[track]]\nnumber="one"\n')
+        with pytest.raises(ValueError, match="is not a number"):
+            cdripper.read_metadata_toml(path)
+
+    def test_blank_track_title_falls_back_to_a_placeholder(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n'
+                                     '[[track]]\nnumber=4\ntitle=""\n')
+        assert cdripper.read_metadata_toml(path)["tracks"][0]["title"] == "Track 04"
+
+    def test_blank_track_artist_inherits_the_album_artist(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n'
+                                     '[[track]]\nnumber=1\nartist=""\n')
+        assert cdripper.read_metadata_toml(path)["tracks"][0]["artist"] == "A"
+
+    def test_tracks_are_sorted_by_number(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n'
+                                     '[[track]]\nnumber=3\n[[track]]\nnumber=1\n')
+        assert [t["number"] for t in cdripper.read_metadata_toml(path)["tracks"]] == [1, 3]
+
+    def test_nonsense_disc_numbers_fall_back_to_one(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="A"\nalbum="B"\n'
+                                     '[disc]\nnumber="x"\ntotal=0\n[[track]]\nnumber=1\n')
+        meta = cdripper.read_metadata_toml(path)
+        assert (meta["disc_number"], meta["disc_total"]) == (1, 1)
+
+    def test_surrounding_whitespace_is_stripped(self, tmp_path):
+        path = self._write(tmp_path, '[album]\nartist="  A  "\nalbum="  B  "\n'
+                                     '[[track]]\nnumber=1\ntitle="  T  "\n')
+        meta = cdripper.read_metadata_toml(path)
+        assert (meta["artist"], meta["album"], meta["tracks"][0]["title"]) == ("A", "B", "T")
+
+
+class TestParseRippedFilename:
+    @pytest.mark.parametrize("name,expected", [
+        ("01 - Robber.flac", (0, 1)),
+        ("2-05 - Nicotine.flac", (2, 5)),
+        ("10-01 - X.flac", (10, 1)),
+        ("03 - Artist - Song.flac", (0, 3)),
+    ])
+    def test_recognises_ripped_names(self, name, expected):
+        assert cdripper._parse_ripped_filename(name) == expected
+
+    @pytest.mark.parametrize("name", [
+        "cover.jpg", "notes.txt", "Robber.flac", "album_info.txt",
+    ])
+    def test_returns_none_for_anything_else(self, name):
+        assert cdripper._parse_ripped_filename(name) is None
+
+
+@pytest.fixture
+def ripped_album(tmp_path):
+    """A realistic rip: real FLACs, tags, album_info, playlist and sidecar.
+
+    Shaped like an unmatched disc, which is the case issue #13 is about.
+    """
+    if not cdripper.shutil.which("flac"):
+        pytest.skip("flac binary not installed")
+
+    import struct
+    frames = int(44100 * 0.05)
+    data = b"\x00" * (frames * 4)
+    header = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " +
+              struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) +
+              b"data" + struct.pack("<I", len(data)))
+    wav = tmp_path / "silence.wav"
+    wav.write_bytes(header + data)
+
+    album_dir = tmp_path / "Music" / "Unknown Artist" / "xK9fL2mQpR7-"
+    album_dir.mkdir(parents=True)
+
+    meta = {
+        "artist": "Unknown Artist", "album": "xK9fL2mQpR7-", "date": "",
+        "is_va": False, "disc_id": "xK9fL2mQpR7-",
+        "disc_number": 1, "disc_total": 1, "disc_subtitle": "",
+        "tracks": [{"number": n, "title": f"Track {n:02d}", "artist": "Unknown Artist"}
+                   for n in (1, 2, 3)],
+    }
+    for track in meta["tracks"]:
+        out = album_dir / cdripper._track_filename(track, meta)
+        subprocess.run(["flac", "-s", "-o", str(out), str(wav)], check=True)
+        cdripper.tag_flac(out, meta, track)
+    cdripper.write_album_info(album_dir, meta)
+    cdripper.write_playlist(album_dir, meta)
+    cdripper.write_metadata_toml(album_dir, meta)
+    return album_dir
+
+
+def _edit_sidecar(album_dir, replacements):
+    path = album_dir / cdripper.METADATA_FILE
+    text = path.read_text()
+    for old, new in replacements:
+        assert old in text, f"pattern not found in sidecar: {old}"
+        text = text.replace(old, new)
+    path.write_text(text)
+
+
+RENAME_ALBUM = [
+    ('artist      = "Unknown Artist"', 'artist      = "The Weather Station"'),
+    ('album       = "xK9fL2mQpR7-"', 'album       = "Live at Massey Hall"'),
+    ('artist = "Unknown Artist"', 'artist = "The Weather Station"'),
+    ('title  = "Track 01"', 'title  = "Robber"'),
+    ('title  = "Track 02"', 'title  = "Atlantic"'),
+    ('title  = "Track 03"', 'title  = "Tried to Tell You"'),
+]
+
+
+class TestApplyMetadata:
+    def test_missing_sidecar_is_an_error(self, tmp_path):
+        with pytest.raises(ValueError, match="no metadata.toml"):
+            cdripper.apply_metadata(tmp_path)
+
+    def test_files_are_renamed_to_the_new_titles(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        names = sorted(p.name for p in new_dir.glob("*.flac"))
+        assert names == ["01 - Robber.flac", "02 - Atlantic.flac",
+                         "03 - Tried to Tell You.flac"]
+
+    def test_album_directory_moves_to_the_new_artist_and_album(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        assert new_dir.name == "Live at Massey Hall"
+        assert new_dir.parent.name == "The Weather Station"
+        assert not ripped_album.exists()
+
+    def test_an_emptied_artist_directory_is_cleaned_up(self, ripped_album):
+        old_artist_dir = ripped_album.parent
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        cdripper.apply_metadata(ripped_album)
+
+        assert not old_artist_dir.exists()
+
+    def test_tags_are_rewritten_from_the_sidecar(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        from mutagen.flac import FLAC
+        tags = FLAC(str(new_dir / "01 - Robber.flac"))
+        assert tags["TITLE"] == ["Robber"]
+        assert tags["ALBUM"] == ["Live at Massey Hall"]
+        assert tags["ALBUMARTIST"] == ["The Weather Station"]
+
+    def test_hand_entered_fields_reach_the_flac_tags(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM + [
+            ('performer   = ""', 'performer   = "Tamara Lindeman"'),
+            ('engineer    = ""', 'engineer    = "J. Rivera"'),
+            ('recorded    = ""', 'recorded    = "2024-03-14"'),
+            ('venue       = ""', 'venue       = "Massey Hall, Toronto"'),
+        ])
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        from mutagen.flac import FLAC
+        tags = FLAC(str(new_dir / "01 - Robber.flac"))
+        assert tags["PERFORMER"] == ["Tamara Lindeman"]
+        assert tags["ENGINEER"] == ["J. Rivera"]
+        assert tags["RECORDINGDATE"] == ["2024-03-14"]
+        assert tags["LOCATION"] == ["Massey Hall, Toronto"]
+
+    def test_clearing_a_field_removes_the_tag(self, ripped_album):
+        _edit_sidecar(ripped_album, [('performer   = ""', 'performer   = "Someone"')])
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        _edit_sidecar(ripped_album, [('performer   = "Someone"', 'performer   = ""')])
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        from mutagen.flac import FLAC
+        assert "PERFORMER" not in FLAC(str(ripped_album / "01 - Track 01.flac"))
+
+    def test_stale_playlist_from_the_old_name_is_removed(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        playlists = sorted(p.name for p in new_dir.glob("*.m3u"))
+        assert playlists == ["The Weather Station - Live at Massey Hall.m3u"]
+
+    def test_a_playlist_we_did_not_write_is_left_alone(self, ripped_album):
+        mine = ripped_album / "my favourites.m3u"
+        mine.write_text("/elsewhere/some other song.flac\n")
+
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        assert (new_dir / "my favourites.m3u").exists()
+
+    def test_playlist_is_rewritten_with_the_new_filenames(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        lines = (new_dir / "The Weather Station - Live at Massey Hall.m3u") \
+            .read_text().splitlines()
+        assert lines == ["01 - Robber.flac", "02 - Atlantic.flac",
+                         "03 - Tried to Tell You.flac"]
+
+    def test_album_info_is_rewritten(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        info = _parse_info(new_dir / "album_info.txt")
+        assert info["ARTIST"] == "The Weather Station"
+        assert info["TRACK01"] == "Robber"
+
+    def test_in_place_leaves_the_directory_where_it_is(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        result = cdripper.apply_metadata(ripped_album, move=False)
+
+        assert result == ripped_album
+        assert (ripped_album / "01 - Robber.flac").exists()
+
+    def test_refuses_to_move_onto_an_existing_directory(self, ripped_album):
+        blocker = ripped_album.parent.parent / "The Weather Station" / "Live at Massey Hall"
+        blocker.mkdir(parents=True)
+        (blocker / "keep me.flac").touch()
+
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        result = cdripper.apply_metadata(ripped_album)
+
+        assert result == ripped_album           # stayed put
+        assert (blocker / "keep me.flac").exists()  # untouched
+
+    def test_a_track_with_no_flac_is_recorded_as_failed(self, ripped_album):
+        (ripped_album / "02 - Track 02.flac").unlink()
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        assert _parse_info(ripped_album / "album_info.txt")["FAILED_TRACKS"] == "2"
+
+    def test_the_sidecar_is_refreshed_in_the_new_location(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        refreshed = cdripper.read_metadata_toml(new_dir / cdripper.METADATA_FILE)
+        assert refreshed["artist"] == "The Weather Station"
+
+    def test_applying_twice_is_a_no_op(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        first = cdripper.apply_metadata(ripped_album)
+        before = sorted(p.name for p in first.iterdir())
+
+        second = cdripper.apply_metadata(first)
+
+        assert second == first
+        assert sorted(p.name for p in second.iterdir()) == before
+
+    def test_giving_two_tracks_the_same_title_keeps_both_files(self, ripped_album):
+        # the track number stays in the filename, so identical titles are fine
+        _edit_sidecar(ripped_album, [
+            ('title  = "Track 01"', 'title  = "Reprise"'),
+            ('title  = "Track 02"', 'title  = "Reprise"'),
+        ])
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        names = sorted(p.name for p in ripped_album.glob("*.flac"))
+        assert names == ["01 - Reprise.flac", "02 - Reprise.flac", "03 - Track 03.flac"]
+        assert not list(ripped_album.glob(".cdripper-rename-*"))
+
+    def test_no_temporary_rename_files_are_left_behind(self, ripped_album):
+        _edit_sidecar(ripped_album, RENAME_ALBUM)
+        new_dir = cdripper.apply_metadata(ripped_album)
+
+        assert not list(new_dir.glob(".cdripper-rename-*"))
+
+    def test_promoting_a_rip_to_disc_two_renames_and_tags_it(self, ripped_album):
+        # editing the disc numbering must not orphan the existing files
+        _edit_sidecar(ripped_album, [("number   = 1", "number   = 2"),
+                                     ("total    = 1", "total    = 2")])
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        names = sorted(p.name for p in ripped_album.glob("*.flac"))
+        assert names == ["2-01 - Track 01.flac", "2-02 - Track 02.flac",
+                         "2-03 - Track 03.flac"]
+
+        from mutagen.flac import FLAC
+        assert FLAC(str(ripped_album / "2-01 - Track 01.flac"))["DISCNUMBER"] == ["2"]
+
+    def test_renumbering_moves_the_sidecar_to_its_per_disc_name(self, ripped_album):
+        _edit_sidecar(ripped_album, [("number   = 1", "number   = 2"),
+                                     ("total    = 1", "total    = 2")])
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        assert (ripped_album / "metadata_disc2.toml").exists()
+        assert not (ripped_album / "metadata.toml").exists()
+
+
+class TestMetadataFromFlacs:
+    def test_errors_when_there_are_no_flacs(self, tmp_path):
+        with pytest.raises(ValueError, match="no FLAC files"):
+            cdripper.metadata_from_flacs(tmp_path)
+
+    def test_rebuilds_album_fields_from_tags(self, ripped_album):
+        meta = cdripper.metadata_from_flacs(ripped_album)
+
+        assert meta["album"] == "xK9fL2mQpR7-"
+        assert meta["artist"] == "Unknown Artist"
+        assert meta["disc_id"] == "xK9fL2mQpR7-"
+
+    def test_rebuilds_the_track_list_in_order(self, ripped_album):
+        meta = cdripper.metadata_from_flacs(ripped_album)
+
+        assert [t["number"] for t in meta["tracks"]] == [1, 2, 3]
+        assert [t["title"] for t in meta["tracks"]] == ["Track 01", "Track 02", "Track 03"]
+
+    def test_round_trips_through_a_regenerated_sidecar(self, ripped_album):
+        (ripped_album / cdripper.METADATA_FILE).unlink()
+
+        meta = cdripper.metadata_from_flacs(ripped_album)
+        cdripper.write_metadata_toml(ripped_album, meta)
+        parsed = cdripper.read_metadata_toml(ripped_album / cdripper.METADATA_FILE)
+
+        assert parsed["artist"] == "Unknown Artist"
+        assert len(parsed["tracks"]) == 3
+
+    def test_extra_tags_are_recovered(self, ripped_album):
+        _edit_sidecar(ripped_album, [('engineer    = ""', 'engineer    = "J. Rivera"')])
+        cdripper.apply_metadata(ripped_album, move=False)
+
+        assert cdripper.metadata_from_flacs(ripped_album)["engineer"] == "J. Rivera"
+
+
+class TestCommandRunners:
+    def test_apply_reports_failure_for_a_directory_with_no_sidecar(self, tmp_path, capsys):
+        assert cdripper._run_apply([str(tmp_path)]) == 1
+        assert "metadata.toml" in capsys.readouterr().err
+
+    def test_apply_succeeds_on_a_real_rip(self, ripped_album):
+        assert cdripper._run_apply([str(ripped_album)], move=False) == 0
+
+    def test_toml_refuses_to_overwrite_without_force(self, ripped_album, capsys):
+        assert cdripper._run_toml([str(ripped_album)]) == 1
+        assert "--force" in capsys.readouterr().err
+
+    def test_toml_overwrites_with_force(self, ripped_album):
+        assert cdripper._run_toml([str(ripped_album)], force=True) == 0
+
+    def test_toml_reports_failure_for_an_empty_directory(self, tmp_path, capsys):
+        assert cdripper._run_toml([str(tmp_path)]) == 1
+        assert "no FLAC files" in capsys.readouterr().err
+
+
+@pytest.fixture
+def multi_disc_album(tmp_path):
+    """A two-disc rip sharing one directory, as issue #12's layout produces."""
+    if not cdripper.shutil.which("flac"):
+        pytest.skip("flac binary not installed")
+
+    import struct
+    data = b"\x00" * (int(44100 * 0.05) * 4)
+    header = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " +
+              struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) +
+              b"data" + struct.pack("<I", len(data)))
+    wav = tmp_path / "silence.wav"
+    wav.write_bytes(header + data)
+
+    album_dir = tmp_path / "Music" / "Ani DiFranco" / "Rome_ Italy"
+    album_dir.mkdir(parents=True)
+
+    for disc, titles in ((1, ["Swan Dive", "Educated Guess"]),
+                         (2, ["Nicotine", "Bubble"])):
+        meta = {
+            "artist": "Ani DiFranco", "album": "Rome, Italy", "date": "2004-11-15",
+            "is_va": False, "disc_id": f"DISC-{disc}",
+            "disc_number": disc, "disc_total": 2, "disc_subtitle": "",
+            "tracks": [{"number": n, "title": t, "artist": "Ani DiFranco"}
+                       for n, t in enumerate(titles, 1)],
+        }
+        for track in meta["tracks"]:
+            out = album_dir / cdripper._track_filename(track, meta)
+            subprocess.run(["flac", "-s", "-o", str(out), str(wav)], check=True)
+            cdripper.tag_flac(out, meta, track)
+        cdripper.write_album_info(album_dir, meta)
+        cdripper.write_playlist(album_dir, meta)
+        cdripper.write_metadata_toml(album_dir, meta)
+    return album_dir
+
+
+class TestMultiDiscSidecars:
+    def test_each_disc_gets_its_own_sidecar(self, multi_disc_album):
+        assert (multi_disc_album / "metadata_disc1.toml").exists()
+        assert (multi_disc_album / "metadata_disc2.toml").exists()
+        assert not (multi_disc_album / "metadata.toml").exists()
+
+    def test_disc_one_sidecar_is_not_overwritten_by_disc_two(self, multi_disc_album):
+        meta = cdripper.read_metadata_toml(multi_disc_album / "metadata_disc1.toml")
+        assert [t["title"] for t in meta["tracks"]] == ["Swan Dive", "Educated Guess"]
+
+    def test_sidecar_paths_are_ordered_by_disc(self, multi_disc_album):
+        names = [p.name for p in cdripper._sidecar_paths(multi_disc_album)]
+        assert names == ["metadata_disc1.toml", "metadata_disc2.toml"]
+
+    def test_disc_10_orders_after_disc_2(self, tmp_path):
+        for n in (2, 10):
+            (tmp_path / f"metadata_disc{n}.toml").touch()
+        names = [p.name for p in cdripper._sidecar_paths(tmp_path)]
+        assert names == ["metadata_disc2.toml", "metadata_disc10.toml"]
+
+    def test_apply_covers_every_disc(self, multi_disc_album):
+        _edit_sidecar_named(multi_disc_album, "metadata_disc1.toml",
+                            [('title  = "Swan Dive"', 'title  = "Swandive"')])
+        _edit_sidecar_named(multi_disc_album, "metadata_disc2.toml",
+                            [('title  = "Nicotine"', 'title  = "Nicotine (Live)"')])
+
+        cdripper.apply_metadata(multi_disc_album, move=False)
+
+        names = sorted(p.name for p in multi_disc_album.glob("*.flac"))
+        assert names == [
+            "1-01 - Swandive.flac",
+            "1-02 - Educated Guess.flac",
+            "2-01 - Nicotine _Live_.flac",
+            "2-02 - Bubble.flac",
+        ]
+
+    def test_apply_keeps_both_discs_info_files(self, multi_disc_album):
+        cdripper.apply_metadata(multi_disc_album, move=False)
+
+        assert (multi_disc_album / "album_info_disc1.txt").exists()
+        assert (multi_disc_album / "album_info_disc2.txt").exists()
+
+    def test_apply_leaves_a_playlist_spanning_both_discs(self, multi_disc_album):
+        cdripper.apply_metadata(multi_disc_album, move=False)
+
+        lines = (multi_disc_album / "Ani DiFranco - Rome_ Italy.m3u").read_text().splitlines()
+        assert len(lines) == 4
+        assert lines[0].startswith("1-01") and lines[-1].startswith("2-02")
+
+    def test_renaming_the_album_moves_it_once_and_keeps_both_discs(self, multi_disc_album):
+        for name in ("metadata_disc1.toml", "metadata_disc2.toml"):
+            _edit_sidecar_named(multi_disc_album, name,
+                                [('album       = "Rome, Italy"',
+                                  'album       = "Rome Italy 2004"')])
+
+        new_dir = cdripper.apply_metadata(multi_disc_album)
+
+        assert new_dir.name == "Rome Italy 2004"
+        assert len(list(new_dir.glob("*.flac"))) == 4
+        assert (new_dir / "metadata_disc1.toml").exists()
+        assert (new_dir / "metadata_disc2.toml").exists()
+
+
+def _edit_sidecar_named(album_dir, name, replacements):
+    path = album_dir / name
+    text = path.read_text()
+    for old, new in replacements:
+        assert old in text, f"pattern not found in {name}: {old}"
+        text = text.replace(old, new)
+    path.write_text(text)
+
+
+# --- degenerate and hostile sidecar values ---
+
+class TestSanitizeFilenameTraversal:
+    @pytest.mark.parametrize("name", [".", "..", "..."])
+    def test_names_made_only_of_dots_are_neutralised(self, name):
+        # these become directory names; ".." would step outside the library
+        result = cdripper.sanitize_filename(name)
+        assert set(result) == {"_"}
+        assert len(result) == len(name)
+
+    def test_dots_elsewhere_in_a_name_are_untouched(self):
+        assert cdripper.sanitize_filename("Sgt. Pepper") == "Sgt. Pepper"
+        assert cdripper.sanitize_filename("...And Justice for All") \
+            == "...And Justice for All"
+
+    def test_separators_are_still_replaced(self):
+        assert "/" not in cdripper.sanitize_filename("../../etc/passwd")
+
+
+class TestApplyRefusesToEscapeTheLibrary:
+    def test_dot_dot_artist_cannot_move_the_album_out_of_the_library(
+            self, ripped_album):
+        library_root = ripped_album.parent.parent          # .../Music
+        outside = library_root.parent
+        before = sorted(p.name for p in outside.iterdir())
+
+        _edit_sidecar(ripped_album, [('artist      = "Unknown Artist"',
+                                      'artist      = ".."')])
+        result = cdripper.apply_metadata(ripped_album)
+
+        # landed somewhere inside the library, and nothing new appeared above it
+        assert library_root.resolve() in result.resolve().parents
+        assert sorted(p.name for p in outside.iterdir()) == before
+
+    def test_slashes_in_an_artist_name_do_not_create_directories(self, ripped_album):
+        _edit_sidecar(ripped_album, [('artist      = "Unknown Artist"',
+                                      'artist      = "AC/DC"')])
+        result = cdripper.apply_metadata(ripped_album)
+
+        assert result.parent.name == "AC_DC"
+
+
+class TestUnreadableFiles:
+    def test_toml_reports_a_corrupt_flac_instead_of_crashing(self, tmp_path, capsys):
+        (tmp_path / "01 - broken.flac").write_text("this is not a FLAC")
+
+        assert cdripper._run_toml([str(tmp_path)]) == 1
+        assert "not readable as FLAC" in capsys.readouterr().err
+
+    def test_metadata_from_flacs_raises_a_clear_error(self, tmp_path):
+        (tmp_path / "01 - broken.flac").write_text("this is not a FLAC")
+
+        with pytest.raises(ValueError, match="not readable as FLAC"):
+            cdripper.metadata_from_flacs(tmp_path)

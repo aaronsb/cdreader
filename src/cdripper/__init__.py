@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -26,7 +27,16 @@ from pathlib import Path
 
 import discid
 import musicbrainzngs
+from mutagen import MutagenError
 from mutagen.flac import FLAC
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 
 try:
     VERSION = pkg_version("cdripper")
@@ -65,6 +75,24 @@ MIN_LOG_COL_WIDTH = 40
 
 # Width of the "HH:MM:SS" gutter in the TUI log panels
 LOG_STAMP_WIDTH = 8
+
+# Hand-editable metadata sidecar, written into every album directory
+METADATA_FILE = "metadata.toml"
+
+# Album-level sidecar fields beyond what MusicBrainz gives us, mapped to the
+# Vorbis comment they are written as. Aimed at recordings MusicBrainz does not
+# carry -- soundboards, school concerts, self-published discs -- where there is
+# a performer and an engineer but no "artist" in the release sense.
+# PERFORMER, LOCATION, DESCRIPTION and GENRE are standard Vorbis comments;
+# ENGINEER and RECORDINGDATE follow MusicBrainz Picard's usage.
+EXTRA_ALBUM_FIELDS = {
+    "genre": "GENRE",
+    "performer": "PERFORMER",
+    "engineer": "ENGINEER",
+    "recorded": "RECORDINGDATE",
+    "venue": "LOCATION",
+    "notes": "DESCRIPTION",
+}
 
 
 # --- Drive state for TUI ---
@@ -338,8 +366,16 @@ def _handle_signal(signum, frame):
 
 
 def sanitize_filename(name, max_length=200):
-    """Replace anything not [-a-zA-Z0-9_ .] with underscore, and truncate."""
+    """Replace anything not [-a-zA-Z0-9_ .] with underscore, and truncate.
+
+    Names made only of dots are neutralised too. Slashes already become
+    underscores, but "." and ".." would otherwise survive as real path
+    components -- and these values become directory names, so a metadata.toml
+    saying artist = ".." would place an album outside the library.
+    """
     sanitized = re.sub(r"[^-\w .]", "_", name)
+    if sanitized and set(sanitized) == {"."}:
+        sanitized = "_" * len(sanitized)
     if len(sanitized.encode("utf-8")) > max_length:
         truncated = sanitized.encode("utf-8")[:max_length].decode("utf-8", errors="ignore")
         sanitized = truncated.rstrip(" _-")
@@ -657,6 +693,14 @@ def tag_flac(path, metadata, track):
         audio["DISCSUBTITLE"] = metadata["disc_subtitle"]
     if metadata.get("date"):
         audio["DATE"] = metadata["date"]
+    # Hand-entered fields from metadata.toml. Blank means "leave it alone", so
+    # an empty box in the sidecar clears the tag rather than writing "".
+    for key, tag in EXTRA_ALBUM_FIELDS.items():
+        value = str(metadata.get(key, "") or "").strip()
+        if value:
+            audio[tag] = value
+        elif tag in audio:
+            del audio[tag]
     audio.save()
 
 
@@ -761,6 +805,412 @@ def _track_filename(track, metadata):
     return f"{num} - {title}.flac"
 
 
+# --- metadata.toml sidecar ---
+
+def _toml_str(value):
+    """Render a value as a TOML basic string."""
+    text = "" if value is None else str(value)
+    for old, new in (("\\", "\\\\"), ('"', '\\"'), ("\n", "\\n"),
+                     ("\r", "\\r"), ("\t", "\\t")):
+        text = text.replace(old, new)
+    return f'"{text}"'
+
+
+def _metadata_file_name(metadata):
+    """Sidecar filename for this disc.
+
+    Every disc of a release shares a directory, so each needs its own sidecar --
+    otherwise the second disc's rip overwrites the first's and applying it
+    would treat disc 1's tracks as missing.
+    """
+    if metadata.get("disc_total", 1) > 1:
+        return f"metadata_disc{metadata.get('disc_number', 1)}.toml"
+    return METADATA_FILE
+
+
+def _sidecar_paths(album_dir):
+    """Every metadata sidecar in a directory, ordered by disc."""
+    album_dir = Path(album_dir)
+    paths = []
+    plain = album_dir / METADATA_FILE
+    if plain.exists():
+        paths.append(plain)
+    numbered = []
+    for candidate in album_dir.glob("metadata_disc*.toml"):
+        match = re.fullmatch(r"metadata_disc(\d+)\.toml", candidate.name)
+        if match:
+            numbered.append((int(match.group(1)), candidate))
+    paths.extend(path for _, path in sorted(numbered))
+    return paths
+
+
+def write_metadata_toml(album_dir, metadata):
+    """Write the hand-editable metadata sidecar for a rip.
+
+    Written for every rip, not just unmatched discs, so an album with good
+    MusicBrainz data can still be corrected or annotated. Known values are
+    pre-filled; the extra fields start blank.
+    """
+    path = Path(album_dir) / _metadata_file_name(metadata)
+    lines = [
+        "# cdripper metadata. Edit this file, then run:",
+        "#",
+        f"#     cdripper apply {shlex.quote(str(album_dir))}",
+        "#",
+        "# Applying re-tags the FLACs, renames them to match changed titles,",
+        "# and moves the album directory if artist or album changed.",
+        "# Blank values are skipped rather than written as empty tags.",
+        "",
+        "[album]",
+        f"artist      = {_toml_str(metadata.get('artist', ''))}",
+        f"album       = {_toml_str(metadata.get('album', ''))}",
+        f"date        = {_toml_str(metadata.get('date', ''))}"
+        "        # release date, YYYY-MM-DD",
+        f"compilation = {str(bool(metadata.get('is_va'))).lower()}"
+        "        # true puts the artist in each filename",
+        "",
+        "# For recordings MusicBrainz does not have: live sets, soundboards,",
+        "# school concerts, self-published discs.",
+    ]
+    for key in EXTRA_ALBUM_FIELDS:
+        comment = {
+            "recorded": "        # when it was recorded, YYYY-MM-DD",
+            "venue": "        # where it was recorded",
+            "engineer": "        # audio engineer",
+        }.get(key, "")
+        lines.append(f"{key:<11} = {_toml_str(metadata.get(key, ''))}{comment}")
+
+    lines += [
+        "",
+        "[disc]",
+        f"number   = {metadata.get('disc_number', 1)}",
+        f"total    = {metadata.get('disc_total', 1)}",
+        f"subtitle = {_toml_str(metadata.get('disc_subtitle', ''))}",
+        f"id       = {_toml_str(metadata.get('disc_id', ''))}"
+        "        # MusicBrainz disc ID -- do not edit",
+        "",
+    ]
+
+    for track in metadata.get("tracks", []):
+        lines += [
+            "[[track]]",
+            f"number = {track['number']}",
+            f"title  = {_toml_str(track.get('title', ''))}",
+            f"artist = {_toml_str(track.get('artist', ''))}",
+            "",
+        ]
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def read_metadata_toml(path):
+    """Parse a metadata sidecar into the metadata dict the writers expect.
+
+    Raises ValueError on anything that would produce a broken rip.
+    """
+    if tomllib is None:
+        raise ValueError(
+            "Reading metadata.toml needs Python 3.11+, or the 'tomli' package "
+            "on older versions. Reinstall with: pipx install --force cdripper")
+
+    path = Path(path)
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"{path.name} is not valid TOML: {e}") from e
+
+    album = data.get("album") or {}
+    disc = data.get("disc") or {}
+    raw_tracks = data.get("track") or []
+
+    artist = str(album.get("artist", "")).strip()
+    title = str(album.get("album", "")).strip()
+    if not artist:
+        raise ValueError("album.artist is empty -- it becomes a directory name")
+    if not title:
+        raise ValueError("album.album is empty -- it becomes a directory name")
+    if not raw_tracks:
+        raise ValueError("no [[track]] entries found")
+
+    tracks, seen = [], set()
+    for entry in raw_tracks:
+        try:
+            number = int(entry.get("number", 0))
+        except (TypeError, ValueError):
+            raise ValueError(f"track number {entry.get('number')!r} is not a number") from None
+        if number < 1:
+            raise ValueError(f"track number {number} must be 1 or greater")
+        if number in seen:
+            raise ValueError(f"track number {number} appears more than once")
+        seen.add(number)
+        tracks.append({
+            "number": number,
+            "title": str(entry.get("title", "")).strip() or f"Track {number:02d}",
+            "artist": str(entry.get("artist", "")).strip() or artist,
+        })
+
+    def _positive_int(value, default):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    metadata = {
+        "artist": artist,
+        "album": title,
+        "date": str(album.get("date", "")).strip(),
+        "is_va": bool(album.get("compilation", False)),
+        "disc_id": str(disc.get("id", "")).strip(),
+        "disc_number": _positive_int(disc.get("number"), 1),
+        "disc_total": _positive_int(disc.get("total"), 1),
+        "disc_subtitle": str(disc.get("subtitle", "")).strip(),
+        "tracks": sorted(tracks, key=lambda t: t["number"]),
+    }
+    for key in EXTRA_ALBUM_FIELDS:
+        metadata[key] = str(album.get(key, "")).strip()
+    return metadata
+
+
+def _parse_ripped_filename(name):
+    """Extract (disc, track) from a ripped FLAC's name, or None if unrecognised."""
+    match = re.match(r"^(?:(\d+)-)?(\d+) - ", name)
+    if not match:
+        return None
+    return (int(match.group(1) or 0), int(match.group(2)))
+
+
+def _track_key(metadata, number):
+    """The (disc, track) key a track's filename should carry."""
+    disc = metadata.get("disc_number", 1) if metadata.get("disc_total", 1) > 1 else 0
+    return (disc, number)
+
+
+def metadata_from_flacs(album_dir):
+    """Rebuild a metadata dict from the FLACs already sitting in a directory.
+
+    Lets rips made before the sidecar existed be brought into the round trip.
+    """
+    album_dir = Path(album_dir)
+    flacs = sorted(album_dir.glob("*.flac"))
+    if not flacs:
+        raise ValueError(f"no FLAC files in {album_dir}")
+
+    def first(tags, key, default=""):
+        value = tags.get(key)
+        return value[0] if value else default
+
+    tracks = []
+    album_tags = None
+    for flac_path in flacs:
+        try:
+            tags = FLAC(str(flac_path))
+        except MutagenError as e:
+            raise ValueError(f"{flac_path.name} is not readable as FLAC: {e}") from e
+        if album_tags is None:
+            album_tags = tags
+        parsed = _parse_ripped_filename(flac_path.name)
+        try:
+            number = int(first(tags, "TRACKNUMBER", "0"))
+        except ValueError:
+            number = 0
+        if number < 1:
+            number = parsed[1] if parsed else len(tracks) + 1
+        tracks.append({
+            "number": number,
+            "title": first(tags, "TITLE", flac_path.stem),
+            "artist": first(tags, "ARTIST"),
+        })
+
+    album_artist = first(album_tags, "ALBUMARTIST") or first(album_tags, "ARTIST")
+    metadata = {
+        "artist": album_artist,
+        "album": first(album_tags, "ALBUM", album_dir.name),
+        "date": first(album_tags, "DATE"),
+        "is_va": len({t["artist"] for t in tracks}) > 1,
+        "disc_id": first(album_tags, "DISCID"),
+        "disc_number": int(first(album_tags, "DISCNUMBER", "1") or 1),
+        "disc_total": int(first(album_tags, "DISCTOTAL", "1") or 1),
+        "disc_subtitle": first(album_tags, "DISCSUBTITLE"),
+        "tracks": sorted(tracks, key=lambda t: t["number"]),
+    }
+    for key, tag in EXTRA_ALBUM_FIELDS.items():
+        metadata[key] = first(album_tags, tag)
+    return metadata
+
+
+def _rename_tracks(album_dir, metadata, logfile=None):
+    """Rename existing FLACs to match the sidecar's titles.
+
+    Renames go via temporary names so a set of changes that permutes existing
+    filenames cannot clobber a file that has not moved yet.
+    """
+    existing = {}
+    for flac_path in album_dir.glob("*.flac"):
+        key = _parse_ripped_filename(flac_path.name)
+        if key is not None:
+            existing[key] = flac_path
+
+    pending = []
+    for track in metadata["tracks"]:
+        source = existing.get(_track_key(metadata, track["number"]))
+        if source is None:
+            # The sidecar's disc numbering may have been edited, in which case
+            # the file on disk still carries the old prefix. Fall back to the
+            # track number alone, but only when it is unambiguous.
+            candidates = [path for (_, number), path in existing.items()
+                          if number == track["number"]]
+            if len(candidates) != 1:
+                continue
+            source = candidates[0]
+        wanted = _track_filename(track, metadata)
+        if source.name != wanted:
+            pending.append((source, wanted))
+
+    if not pending:
+        return 0
+
+    staged = []
+    for index, (source, wanted) in enumerate(pending):
+        temp = album_dir / f".cdripper-rename-{index}"
+        source.rename(temp)
+        staged.append((temp, wanted))
+    for temp, wanted in staged:
+        temp.rename(album_dir / wanted)
+
+    log(f"Renamed {len(pending)} file(s)", logfile)
+    return len(pending)
+
+
+def _remove_stale_sidecars(album_dir, metadata, logfile=None, keep_info=None):
+    """Delete our own playlist/info files left orphaned by a rename.
+
+    The playlist is named after the artist and album, so correcting either in
+    the sidecar leaves the old one behind pointing at files that have moved.
+    Only files this program clearly wrote are removed: a playlist has to
+    consist entirely of ripped-track filenames, none of which still resolve.
+    """
+    removed = 0
+    keep_playlist = (f"{sanitize_filename(metadata['artist'])} - "
+                     f"{sanitize_filename(metadata['album'])}.m3u")
+    for m3u in album_dir.glob("*.m3u"):
+        if m3u.name == keep_playlist:
+            continue
+        entries = [ln.strip() for ln in m3u.read_text().splitlines() if ln.strip()]
+        if not entries or not all(_parse_ripped_filename(e) for e in entries):
+            continue  # not ours -- leave it alone
+        if any((album_dir / e).exists() for e in entries):
+            continue  # still points at real files
+        m3u.unlink()
+        removed += 1
+        log(f"Removed stale playlist {m3u.name}", logfile)
+
+    # Switching between the single- and multi-disc naming leaves the other
+    # convention's info file behind. Sibling discs' files must survive.
+    keep_info = keep_info or {_album_info_name(metadata)}
+    multi = metadata.get("disc_total", 1) > 1
+    for info in album_dir.glob("album_info*.txt"):
+        if info.name in keep_info:
+            continue
+        per_disc = re.fullmatch(r"album_info_disc\d+\.txt", info.name)
+        if multi and per_disc:
+            continue  # belongs to another disc of this release
+        info.unlink()
+        removed += 1
+        log(f"Removed stale {info.name}", logfile)
+    return removed
+
+
+def _relocate_album(album_dir, metadata, logfile=None):
+    """Move the album directory if artist or album changed. Returns the new path."""
+    library_root = album_dir.parent.parent
+    target = (library_root
+              / sanitize_filename(metadata["artist"])
+              / sanitize_filename(metadata["album"]))
+    if target.resolve() == album_dir.resolve():
+        return album_dir
+
+    # Defence in depth: the sidecar is editable, and these values become
+    # directory names. Never write outside the library the album came from.
+    root = library_root.resolve()
+    if root not in target.resolve().parents:
+        log(f"Refusing to move outside {root}: artist/album resolve to {target}",
+            logfile)
+        return album_dir
+    if target.exists():
+        log(f"Not moving: {target} already exists. Files updated in place.", logfile)
+        return album_dir
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    album_dir.rename(target)
+    log(f"Moved album to {target}", logfile)
+
+    # Tidy up an artist directory left empty by the move
+    old_artist_dir = album_dir.parent
+    with contextlib.suppress(OSError):
+        old_artist_dir.rmdir()
+    return target
+
+
+def apply_metadata(album_dir, logfile=None, move=True):
+    """Apply a directory's metadata sidecars back onto the rip they describe.
+
+    Re-tags every FLAC, renames files whose titles changed, rewrites
+    album_info.txt and the playlist, and moves the album directory when the
+    artist or album name changed. A multi-disc album has one sidecar per disc
+    and all of them are applied. Returns the directory the album now lives in.
+    """
+    album_dir = Path(album_dir)
+    sidecars = _sidecar_paths(album_dir)
+    if not sidecars:
+        raise ValueError(f"no {METADATA_FILE} in {album_dir}")
+
+    applied, tagged = [], 0
+    for sidecar in sidecars:
+        metadata = read_metadata_toml(sidecar)
+        _rename_tracks(album_dir, metadata, logfile)
+
+        missing = []
+        for track in metadata["tracks"]:
+            flac_path = album_dir / _track_filename(track, metadata)
+            if not flac_path.exists():
+                missing.append(track["number"])
+                continue
+            tag_flac(flac_path, metadata, track)
+            tagged += 1
+
+        failed = set(missing) or None
+        write_album_info(album_dir, metadata, failed)
+        write_playlist(album_dir, metadata, failed)
+        if missing:
+            log(f"No FLAC for track(s) {', '.join(str(n) for n in sorted(missing))}"
+                f" of disc {metadata.get('disc_number', 1)} -- recorded as failed",
+                logfile)
+        applied.append((sidecar, metadata))
+
+    # All discs of a release share an artist and album, so the first sidecar
+    # decides where the directory belongs.
+    primary = applied[0][1]
+    _remove_stale_sidecars(album_dir, primary, logfile,
+                           keep_info={_album_info_name(m) for _, m in applied})
+
+    if move:
+        album_dir = _relocate_album(album_dir, primary, logfile)
+
+    # Refresh each sidecar in its final location, dropping any whose name
+    # changed because the disc numbering was edited.
+    for sidecar, metadata in applied:
+        written = write_metadata_toml(album_dir, metadata)
+        stale = album_dir / sidecar.name
+        if stale != written and stale.exists():
+            stale.unlink()
+
+    log(f"Applied metadata to {tagged} file(s) in {album_dir}", logfile)
+    return album_dir
+
+
 def eject_disc(device):
     """Eject the disc."""
     subprocess.run(["eject", device], capture_output=True)
@@ -862,7 +1312,10 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
 
     write_album_info(album_dir, metadata, failed_tracks or None)
     write_playlist(album_dir, metadata, failed_tracks or None)
+    write_metadata_toml(album_dir, metadata)
     log(f"Album written to {album_dir}", logfile, device)
+    log(f"Edit {METADATA_FILE} there and run 'cdripper apply' to correct it",
+        logfile, device)
 
     if drive_state:
         drive_state.update(status="Done", speed=0.0, track_num=total, track_progress=1.0)
@@ -929,6 +1382,39 @@ def poll_and_rip(device, output_dir, poll_interval=2):
     log("Stopped.", logfile, device)
 
 
+def _run_apply(paths, move=True):
+    """`cdripper apply` -- returns a process exit code."""
+    failures = 0
+    for raw in paths:
+        album_dir = Path(raw).expanduser()
+        try:
+            apply_metadata(album_dir, move=move)
+        except (ValueError, OSError, MutagenError) as e:
+            print(f"{album_dir}: {e}", file=sys.stderr)
+            failures += 1
+    return 1 if failures else 0
+
+
+def _run_toml(paths, force=False):
+    """`cdripper toml` -- returns a process exit code."""
+    failures = 0
+    for raw in paths:
+        album_dir = Path(raw).expanduser()
+        sidecar = album_dir / METADATA_FILE
+        if sidecar.exists() and not force:
+            print(f"{sidecar} exists; pass --force to overwrite", file=sys.stderr)
+            failures += 1
+            continue
+        try:
+            metadata = metadata_from_flacs(album_dir)
+        except (ValueError, OSError, MutagenError) as e:
+            print(f"{album_dir}: {e}", file=sys.stderr)
+            failures += 1
+            continue
+        print(f"Wrote {write_metadata_toml(album_dir, metadata)}")
+    return 1 if failures else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Rip audio CDs to FLAC with MusicBrainz metadata."
@@ -954,10 +1440,41 @@ def main():
         action="version",
         version=f"cdripper {VERSION}",
     )
+
+    # Subcommands are optional: bare `cdripper` still polls and rips.
+    sub = parser.add_subparsers(dest="command")
+
+    apply_cmd = sub.add_parser(
+        "apply",
+        help=f"apply an edited {METADATA_FILE} back onto its rip",
+        description=f"Re-tag, rename and relocate a rip from its {METADATA_FILE}.",
+    )
+    apply_cmd.add_argument("paths", nargs="+", help="album directories")
+    apply_cmd.add_argument(
+        "--in-place", action="store_true",
+        help="re-tag without moving the directory when artist/album changed",
+    )
+
+    toml_cmd = sub.add_parser(
+        "toml",
+        help=f"(re)generate {METADATA_FILE} from the FLACs already in a directory",
+        description="Bring an existing rip into the edit/apply round trip.",
+    )
+    toml_cmd.add_argument("paths", nargs="+", help="album directories")
+    toml_cmd.add_argument(
+        "-f", "--force", action="store_true",
+        help=f"overwrite an existing {METADATA_FILE}",
+    )
+
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    if args.command == "apply":
+        sys.exit(_run_apply(args.paths, move=not args.in_place))
+    if args.command == "toml":
+        sys.exit(_run_toml(args.paths, force=args.force))
 
     check_dependencies()
 
