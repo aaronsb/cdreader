@@ -3,7 +3,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.claude/
+# Claude Code: share the project's skills, keep personal settings out.
+.claude/*
+!.claude/skills/
 
 # virtualenvs
 .venv/

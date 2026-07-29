@@ -116,6 +116,9 @@ Tests cover the pure logic: filename sanitizing, MusicBrainz response parsing,
 need a real disc in a real drive aren't unit tested — verify those with
 `make once` against an actual CD.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch/PR/review workflow, and
+[CLAUDE.md](CLAUDE.md) for architecture notes and the threading model.
+
 ## License
 
 MIT
