@@ -96,6 +96,26 @@ Installed automatically by `setup.sh`:
 
 Multiple drives rip in parallel, each in its own thread with prefixed log output.
 
+## Development
+
+```bash
+make deps      # system packages (cdparanoia, flac, libdiscid, eject) -- needs sudo
+make dev       # create .venv and install cdripper + dev tools, editable
+make test      # run the unit tests
+make lint      # ruff
+make check     # verify binaries, imports, and detected drives
+make help      # list every target
+```
+
+`make check` is the fastest way to confirm a machine is set up correctly — it
+reports missing system binaries, unimportable Python modules, and which optical
+drives were detected.
+
+Tests cover the pure logic: filename sanitizing, MusicBrainz response parsing,
+`album_info.txt`/`.m3u` output, drive detection, and FLAC tagging. Paths that
+need a real disc in a real drive aren't unit tested — verify those with
+`make once` against an actual CD.
+
 ## License
 
 MIT
