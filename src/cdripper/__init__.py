@@ -478,20 +478,12 @@ def lookup_metadata(disc, logfile=None, device=None):
     album = release.get("title", "Unknown Album")
     date = release.get("date", "")
 
-    tracks = []
-    for medium in release.get("medium-list", []):
-        for disc_entry in medium.get("disc-list", []):
-            if disc_entry.get("id") == disc.id:
-                tracks = _extract_tracks(medium, album_artist)
-                break
-        if tracks:
-            break
+    media = release.get("medium-list", [])
+    matched = _match_medium(media, disc.id)
+    if matched is None:
+        return None
 
-    if not tracks:
-        for medium in release.get("medium-list", []):
-            tracks = _extract_tracks(medium, album_artist)
-            break
-
+    tracks = _extract_tracks(matched, album_artist)
     if not tracks:
         return None
 
@@ -504,7 +496,37 @@ def lookup_metadata(disc, logfile=None, device=None):
         "tracks": sorted(tracks, key=lambda t: t["number"]),
         "is_va": is_va,
         "disc_id": disc.id,
+        "disc_number": _medium_position(matched, media),
+        "disc_total": len(media) or 1,
+        "disc_subtitle": matched.get("title", ""),
     }
+
+
+def _match_medium(media, disc_id):
+    """Find the medium carrying this disc ID, falling back to the first one."""
+    for medium in media:
+        for disc_entry in medium.get("disc-list", []):
+            if disc_entry.get("id") == disc_id:
+                return medium
+    return media[0] if media else None
+
+
+def _medium_position(medium, media):
+    """1-based position of a medium within its release.
+
+    Prefers MusicBrainz's own `position`, falling back to list order when it
+    is missing or unparseable.
+    """
+    try:
+        position = int(medium.get("position", 0))
+    except (TypeError, ValueError):
+        position = 0
+    if position > 0:
+        return position
+    try:
+        return media.index(medium) + 1
+    except ValueError:
+        return 1
 
 
 def _extract_tracks(medium, album_artist):
@@ -614,20 +636,42 @@ def tag_flac(path, metadata, track):
     audio["TRACKTOTAL"] = str(len(metadata["tracks"]))
     audio["ALBUMARTIST"] = metadata["artist"]
     audio["DISCID"] = metadata["disc_id"]
+    # Media servers group multi-disc releases by these, not by directory layout
+    audio["DISCNUMBER"] = str(metadata.get("disc_number", 1))
+    audio["DISCTOTAL"] = str(metadata.get("disc_total", 1))
+    if metadata.get("disc_subtitle"):
+        audio["DISCSUBTITLE"] = metadata["disc_subtitle"]
     if metadata.get("date"):
         audio["DATE"] = metadata["date"]
     audio.save()
 
 
+def _album_info_name(metadata):
+    """Filename for this disc's info file.
+
+    Every disc of a release shares one directory, and DISCID, TRACKS and
+    FAILED_TRACKS are all per-disc facts. Rather than merge them into one
+    ambiguous file, each disc of a multi-disc release gets its own.
+    """
+    if metadata.get("disc_total", 1) > 1:
+        return f"album_info_disc{metadata.get('disc_number', 1)}.txt"
+    return "album_info.txt"
+
+
 def write_album_info(album_dir, metadata, failed_tracks=None):
     """Write album_info.txt with tag data and any failures."""
-    info_path = album_dir / "album_info.txt"
+    info_path = album_dir / _album_info_name(metadata)
     with open(info_path, "w") as f:
         f.write(f"ARTIST={metadata['artist']}\n")
         f.write(f"ALBUM={metadata['album']}\n")
         if metadata.get("date"):
             f.write(f"DATE={metadata['date']}\n")
         f.write(f"DISCID={metadata['disc_id']}\n")
+        if metadata.get("disc_total", 1) > 1:
+            f.write(f"DISCNUMBER={metadata.get('disc_number', 1)}\n")
+            f.write(f"DISCTOTAL={metadata['disc_total']}\n")
+            if metadata.get("disc_subtitle"):
+                f.write(f"DISCSUBTITLE={metadata['disc_subtitle']}\n")
         f.write(f"TRACKS={len(metadata['tracks'])}\n")
 
         if failed_tracks:
@@ -643,21 +687,55 @@ def write_album_info(album_dir, metadata, failed_tracks=None):
                 f.write(f"TRACK{num:02d}={track['title']}\n")
 
 
+def _playlist_sort_key(name):
+    """Order playlist entries by disc then track, not by string.
+
+    Lexical order would put "10-01" before "2-01" on a box set.
+    """
+    match = re.match(r"^(?:(\d+)-)?(\d+) - ", name)
+    if match:
+        return (int(match.group(1) or 0), int(match.group(2)), name)
+    return (0, 0, name)
+
+
 def write_playlist(album_dir, metadata, failed_tracks=None):
-    """Write .m3u playlist file (skipping failed tracks)."""
+    """Write .m3u playlist file (skipping failed tracks).
+
+    Every disc of a release writes into the same directory, so for a multi-disc
+    album this merges with what an earlier disc already wrote. Replacing it
+    would leave a playlist holding only whichever disc was ripped last.
+    """
     artist_safe = sanitize_filename(metadata["artist"])
     album_safe = sanitize_filename(metadata["album"])
     m3u_path = album_dir / f"{artist_safe} - {album_safe}.m3u"
+
+    entries = []
+    if metadata.get("disc_total", 1) > 1 and m3u_path.exists():
+        entries = [ln for ln in m3u_path.read_text().splitlines() if ln.strip()]
+
+    for track in metadata["tracks"]:
+        if failed_tracks and track["number"] in failed_tracks:
+            continue
+        name = _track_filename(track, metadata)
+        if name not in entries:
+            entries.append(name)
+
     with open(m3u_path, "w") as f:
-        for track in metadata["tracks"]:
-            if failed_tracks and track["number"] in failed_tracks:
-                continue
-            f.write(_track_filename(track, metadata) + "\n")
+        for name in sorted(entries, key=_playlist_sort_key):
+            f.write(name + "\n")
 
 
 def _track_filename(track, metadata):
-    """Build the FLAC filename for a track."""
+    """Build the FLAC filename for a track.
+
+    Multi-disc releases get a `disc-` prefix on the track number, so both discs
+    can share one album directory without colliding. This matches MusicBrainz
+    Picard's default naming and keeps the release as a single album in Plex,
+    Jellyfin and Navidrome. Single-disc rips are unaffected.
+    """
     num = f"{track['number']:02d}"
+    if metadata.get("disc_total", 1) > 1:
+        num = f"{metadata.get('disc_number', 1)}-{num}"
     title = sanitize_filename(track["title"])
     if metadata["is_va"]:
         return f"{num} - {sanitize_filename(track['artist'])} - {title}.flac"
@@ -693,6 +771,9 @@ def rip_disc(disc, device, output_dir, logfile, drive_state=None):
             ],
             "is_va": False,
             "disc_id": disc.id,
+            "disc_number": 1,
+            "disc_total": 1,
+            "disc_subtitle": "",
         }
     else:
         log(f"Found: {metadata['artist']} - {metadata['album']}", logfile, device)

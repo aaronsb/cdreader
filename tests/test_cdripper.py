@@ -156,12 +156,43 @@ def _mb_response(disc_id="DISCID123", artist="Queen", title="A Night at the Oper
         "title": title,
         "date": "1975-11-21",
         "medium-list": [{
+            "position": "1",
             "disc-list": [{"id": disc_id}],
             "track-list": [
                 {"number": "2", "recording": {"title": "Lazing"}},
                 {"number": "1", "recording": {"title": "Death on Two Legs"}},
             ],
         }],
+    }]}}
+
+
+def _mb_multidisc(matching_disc_id):
+    """Two-CD release modelled on the one in issue #12 (Ani DiFranco, Rome Italy).
+
+    Both discs have a track 1, which is what collided in a shared directory.
+    """
+    return {"disc": {"release-list": [{
+        "artist-credit-phrase": "Ani DiFranco",
+        "title": "Rome, Italy 11.15.04",
+        "date": "2004-11-15",
+        "medium-list": [
+            {
+                "position": "1",
+                "disc-list": [{"id": "DISC-ONE"}],
+                "track-list": [
+                    {"number": "1", "recording": {"title": "Swan Dive"}},
+                    {"number": "2", "recording": {"title": "Educated Guess"}},
+                ],
+            },
+            {
+                "position": "2",
+                "disc-list": [{"id": "DISC-TWO"}],
+                "track-list": [
+                    {"number": "1", "recording": {"title": "Nicotine"}},
+                    {"number": "2", "recording": {"title": "Bubble"}},
+                ],
+            },
+        ],
     }]}}
 
 
@@ -233,6 +264,115 @@ class TestLookupMetadata:
 
         assert cdripper.lookup_metadata(SimpleNamespace(id="X")) is None
         assert len(calls) == cdripper.MB_RETRIES
+
+
+# --- multi-disc handling (issue #12) ---
+
+class TestMultiDiscLookup:
+    @pytest.mark.parametrize("disc_id,position,first_title", [
+        ("DISC-ONE", 1, "Swan Dive"),
+        ("DISC-TWO", 2, "Nicotine"),
+    ])
+    def test_identifies_which_medium_the_inserted_disc_is(
+            self, monkeypatch, disc_id, position, first_title):
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: _mb_multidisc(disc_id))
+
+        meta = cdripper.lookup_metadata(SimpleNamespace(id=disc_id))
+
+        assert meta["disc_number"] == position
+        assert meta["disc_total"] == 2
+        assert meta["tracks"][0]["title"] == first_title
+
+    def test_single_disc_release_reports_one_of_one(self, monkeypatch):
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: _mb_response())
+
+        meta = cdripper.lookup_metadata(SimpleNamespace(id="DISCID123"))
+        assert (meta["disc_number"], meta["disc_total"]) == (1, 1)
+
+    def test_disc_subtitle_is_captured_when_the_medium_has_one(self, monkeypatch):
+        payload = _mb_multidisc("DISC-ONE")
+        payload["disc"]["release-list"][0]["medium-list"][0]["title"] = "The Acoustic Set"
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: payload)
+
+        meta = cdripper.lookup_metadata(SimpleNamespace(id="DISC-ONE"))
+        assert meta["disc_subtitle"] == "The Acoustic Set"
+
+    def test_missing_position_falls_back_to_list_order(self, monkeypatch):
+        payload = _mb_multidisc("DISC-TWO")
+        for medium in payload["disc"]["release-list"][0]["medium-list"]:
+            medium.pop("position")
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: payload)
+
+        assert cdripper.lookup_metadata(SimpleNamespace(id="DISC-TWO"))["disc_number"] == 2
+
+    def test_unparseable_position_falls_back_to_list_order(self, monkeypatch):
+        payload = _mb_multidisc("DISC-TWO")
+        for medium in payload["disc"]["release-list"][0]["medium-list"]:
+            medium["position"] = "side B"
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: payload)
+
+        assert cdripper.lookup_metadata(SimpleNamespace(id="DISC-TWO"))["disc_number"] == 2
+
+    def test_unknown_disc_id_falls_back_to_the_first_medium(self, monkeypatch):
+        monkeypatch.setattr(cdripper.musicbrainzngs, "get_releases_by_discid",
+                            lambda *a, **k: _mb_multidisc("DISC-ONE"))
+
+        meta = cdripper.lookup_metadata(SimpleNamespace(id="NOT-IN-RELEASE"))
+        assert meta["disc_number"] == 1
+
+
+class TestMultiDiscFilenames:
+    def test_track_numbers_are_disc_prefixed_on_multi_disc_releases(self):
+        meta = {"is_va": False, "disc_number": 2, "disc_total": 2}
+        track = {"number": 1, "title": "Nicotine", "artist": "Ani DiFranco"}
+        assert cdripper._track_filename(track, meta) == "2-01 - Nicotine.flac"
+
+    def test_single_disc_filenames_are_unchanged(self):
+        meta = {"is_va": False, "disc_number": 1, "disc_total": 1}
+        track = {"number": 1, "title": "Swan Dive", "artist": "Ani DiFranco"}
+        assert cdripper._track_filename(track, meta) == "01 - Swan Dive.flac"
+
+    def test_metadata_without_disc_keys_behaves_as_single_disc(self):
+        # older callers, and the no-MusicBrainz-match fallback
+        assert cdripper._track_filename(
+            {"number": 3, "title": "X", "artist": "Y"}, {"is_va": False}) == "03 - X.flac"
+
+    def test_the_two_colliding_tracks_from_issue_12_no_longer_collide(self):
+        disc1 = {"is_va": False, "disc_number": 1, "disc_total": 2}
+        disc2 = {"is_va": False, "disc_number": 2, "disc_total": 2}
+
+        a = cdripper._track_filename({"number": 1, "title": "Swan Dive", "artist": "A"}, disc1)
+        b = cdripper._track_filename({"number": 1, "title": "Nicotine", "artist": "A"}, disc2)
+
+        assert a != b
+        assert a.startswith("1-01") and b.startswith("2-01")
+
+    def test_various_artists_multi_disc_keeps_both_prefixes(self):
+        meta = {"is_va": True, "disc_number": 2, "disc_total": 2}
+        track = {"number": 5, "title": "Song", "artist": "Some Band"}
+        assert cdripper._track_filename(track, meta) == "2-05 - Some Band - Song.flac"
+
+
+class TestPlaylistSortKey:
+    def test_orders_by_disc_then_track(self):
+        names = ["2-01 - B.flac", "1-02 - A.flac", "1-01 - C.flac"]
+        assert sorted(names, key=cdripper._playlist_sort_key) == [
+            "1-01 - C.flac", "1-02 - A.flac", "2-01 - B.flac"]
+
+    def test_disc_10_sorts_after_disc_2_not_lexically(self):
+        names = ["10-01 - X.flac", "2-01 - Y.flac"]
+        assert sorted(names, key=cdripper._playlist_sort_key) == [
+            "2-01 - Y.flac", "10-01 - X.flac"]
+
+    def test_single_disc_names_still_order_by_track(self):
+        names = ["10 - J.flac", "02 - B.flac", "01 - A.flac"]
+        assert sorted(names, key=cdripper._playlist_sort_key) == [
+            "01 - A.flac", "02 - B.flac", "10 - J.flac"]
 
 
 # --- album_info.txt ---
@@ -334,6 +474,112 @@ class TestWritePlaylist:
         metadata["artist"] = "AC/DC"
         cdripper.write_playlist(tmp_path, metadata)
         assert (tmp_path / "AC_DC - A Night at the Opera.m3u").exists()
+
+
+# --- multi-disc rips sharing one directory (issue #12) ---
+
+def _disc_metadata(number, total, tracks):
+    return {
+        "artist": "Ani DiFranco",
+        "album": "Rome, Italy 11.15.04",
+        "date": "2004-11-15",
+        "disc_id": f"DISC-{number}",
+        "is_va": False,
+        "disc_number": number,
+        "disc_total": total,
+        "disc_subtitle": "",
+        "tracks": [{"number": n, "title": t, "artist": "Ani DiFranco"}
+                   for n, t in tracks],
+    }
+
+
+DISC1 = [(1, "Swan Dive"), (2, "Educated Guess")]
+DISC2 = [(1, "Nicotine"), (2, "Bubble")]
+
+# The comma in "Rome, Italy" is not in the allowed charset, so it sanitizes
+# to an underscore -- this is the name write_playlist actually produces.
+M3U_NAME = "Ani DiFranco - Rome_ Italy 11.15.04.m3u"
+
+
+class TestMultiDiscSharedDirectory:
+    def test_each_disc_gets_its_own_info_file(self, tmp_path):
+        cdripper.write_album_info(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_album_info(tmp_path, _disc_metadata(2, 2, DISC2))
+
+        assert (tmp_path / "album_info_disc1.txt").exists()
+        assert (tmp_path / "album_info_disc2.txt").exists()
+        assert not (tmp_path / "album_info.txt").exists()
+
+    def test_disc_one_info_survives_ripping_disc_two(self, tmp_path):
+        cdripper.write_album_info(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_album_info(tmp_path, _disc_metadata(2, 2, DISC2))
+
+        info1 = _parse_info(tmp_path / "album_info_disc1.txt")
+        assert info1["TRACK01"] == "Swan Dive"
+        assert info1["DISCID"] == "DISC-1"
+        assert info1["DISCNUMBER"] == "1"
+        assert info1["DISCTOTAL"] == "2"
+
+    def test_single_disc_release_keeps_the_plain_filename(self, tmp_path):
+        cdripper.write_album_info(tmp_path, _disc_metadata(1, 1, DISC1))
+
+        assert (tmp_path / "album_info.txt").exists()
+        info = _parse_info(tmp_path / "album_info.txt")
+        assert "DISCNUMBER" not in info  # not noise on ordinary albums
+
+    def test_disc_subtitle_is_recorded_when_present(self, tmp_path):
+        meta = _disc_metadata(1, 2, DISC1)
+        meta["disc_subtitle"] = "The Acoustic Set"
+        cdripper.write_album_info(tmp_path, meta)
+
+        assert _parse_info(tmp_path / "album_info_disc1.txt")["DISCSUBTITLE"] \
+            == "The Acoustic Set"
+
+    def test_playlist_accumulates_both_discs_rather_than_being_replaced(self, tmp_path):
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_playlist(tmp_path, _disc_metadata(2, 2, DISC2))
+
+        lines = (tmp_path / M3U_NAME).read_text().splitlines()
+        assert lines == [
+            "1-01 - Swan Dive.flac",
+            "1-02 - Educated Guess.flac",
+            "2-01 - Nicotine.flac",
+            "2-02 - Bubble.flac",
+        ]
+
+    def test_playlist_merge_is_order_independent(self, tmp_path):
+        # discs can finish in either order across parallel drives
+        cdripper.write_playlist(tmp_path, _disc_metadata(2, 2, DISC2))
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+
+        lines = (tmp_path / M3U_NAME).read_text().splitlines()
+        assert lines[0] == "1-01 - Swan Dive.flac"
+        assert lines[-1] == "2-02 - Bubble.flac"
+
+    def test_re_ripping_the_same_disc_does_not_duplicate_entries(self, tmp_path):
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+
+        lines = (tmp_path / M3U_NAME).read_text().splitlines()
+        assert lines == ["1-01 - Swan Dive.flac", "1-02 - Educated Guess.flac"]
+
+    def test_failed_tracks_are_still_excluded_when_merging(self, tmp_path):
+        cdripper.write_playlist(tmp_path, _disc_metadata(1, 2, DISC1))
+        cdripper.write_playlist(tmp_path, _disc_metadata(2, 2, DISC2), failed_tracks={1})
+
+        content = (tmp_path / M3U_NAME).read_text()
+        assert "Nicotine" not in content
+        assert "2-02 - Bubble.flac" in content
+        assert "1-01 - Swan Dive.flac" in content  # disc 1 untouched
+
+    def test_single_disc_playlist_is_replaced_not_merged(self, tmp_path, metadata):
+        # a re-rip of a normal album should not accumulate stale entries
+        cdripper.write_playlist(tmp_path, metadata)
+        metadata["tracks"] = metadata["tracks"][:1]
+        cdripper.write_playlist(tmp_path, metadata)
+
+        lines = (tmp_path / "Queen - A Night at the Opera.m3u").read_text().splitlines()
+        assert lines == ["01 - Death on Two Legs.flac"]
 
 
 # --- detect_drives ---
@@ -663,3 +909,31 @@ class TestTagFlac:
 
         from mutagen.flac import FLAC
         assert "DATE" not in FLAC(str(flac_file))
+
+    def test_writes_disc_tags_so_players_group_multi_disc_releases(self, flac_file):
+        meta = _disc_metadata(2, 2, DISC2)
+        cdripper.tag_flac(flac_file, meta, meta["tracks"][0])
+
+        from mutagen.flac import FLAC
+        tags = FLAC(str(flac_file))
+        assert tags["DISCNUMBER"] == ["2"]
+        assert tags["DISCTOTAL"] == ["2"]
+
+    def test_single_disc_albums_are_tagged_one_of_one(self, flac_file, metadata):
+        cdripper.tag_flac(flac_file, metadata, metadata["tracks"][0])
+
+        from mutagen.flac import FLAC
+        tags = FLAC(str(flac_file))
+        assert tags["DISCNUMBER"] == ["1"]
+        assert tags["DISCTOTAL"] == ["1"]
+
+    def test_disc_subtitle_is_tagged_only_when_present(self, flac_file):
+        from mutagen.flac import FLAC
+
+        meta = _disc_metadata(1, 2, DISC1)
+        cdripper.tag_flac(flac_file, meta, meta["tracks"][0])
+        assert "DISCSUBTITLE" not in FLAC(str(flac_file))
+
+        meta["disc_subtitle"] = "The Acoustic Set"
+        cdripper.tag_flac(flac_file, meta, meta["tracks"][0])
+        assert FLAC(str(flac_file))["DISCSUBTITLE"] == ["The Acoustic Set"]
